@@ -157,3 +157,25 @@ Prompt 관리 방법 등의 세부 사항은 실제 개발 및 테스트 과정�
 따라서 초기 계획에 모든 기능을 고정하기보다는
 각 주차의 핵심 기능을 우선 구현하고,
 개발 과정에서 필요한 세부 기능을 점진적으로 보완하는 방식으로 진행할 계획입니다.
+
+---
+
+## 6. 1주차 챗봇 실행 방법
+
+현재 1주차 범위인 Google Gemini API 기반 CLI 챗봇이 구현되어 있습니다. Python 3.10 이상이 필요하며 별도 외부 패키지는 사용하지 않습니다.
+
+1. `.env.example`을 복사해 프로젝트 루트에 `.env` 파일을 만듭니다.
+2. `GEMINI_API_KEY`에 Google AI Studio에서 발급받은 API Key를, `GEMINI_MODEL`에 사용할 Gemini 모델 ID를 입력합니다.
+3. 프로젝트 루트에서 다음 명령으로 실행합니다.
+
+```bash
+python -m script.main
+```
+
+채팅 중 `/clear`를 입력하면 대화 기록을 지우고, `/exit` 또는 `exit`를 입력하면 종료합니다. API Key가 들어 있는 `.env`와 `setting/api_key.json`은 Git 추적 대상에서 제외됩니다.
+
+테스트는 실제 API를 호출하지 않으며 다음 명령으로 실행합니다.
+
+```bash
+python -m unittest discover -s tests -v
+```

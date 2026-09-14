@@ -1,0 +1,7 @@
+개인프로젝트
+1. 뭐에관한챗봇
+2. 기능정의
+
+api LLm활용
+
+그럼 이거에서 기존 Persistent-Multi-Agent-Story-Engine 길이를 대폭 줄이고 그냥 번역 ai 챗봇 만드는개 개인 1차 프로잭트로 해줘
