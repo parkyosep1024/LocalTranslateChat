@@ -81,10 +81,11 @@ class PromptBuilder:
         source_language: str,
         target_language: str,
         document_type: str,
+        sample_text: str | None = None,
     ) -> str:
-        samples = self.collect_samples(files)
+        samples = sample_text if sample_text is not None else self.collect_samples(files)
         if not samples:
-            raise FileProcessingError("Prompt를 작성할 TXT 샘플이 없습니다.")
+            raise FileProcessingError("Prompt를 작성할 번역 대상 샘플이 없습니다.")
 
         request = f"""다음 문서 샘플을 분석하여 실제 번역에 사용할 시스템 Prompt를 작성하세요.
 
@@ -111,10 +112,11 @@ class PromptBuilder:
         source_language: str,
         target_language: str,
         document_type: str,
+        sample_text: str | None = None,
     ) -> str:
         if not user_request.strip():
             raise ValueError("Prompt 수정 요구사항을 입력해 주세요.")
-        samples = self.collect_samples(files)
+        samples = sample_text if sample_text is not None else self.collect_samples(files)
         request = f"""기존 Translation Prompt를 사용자 요구사항에 맞게 다시 작성하세요.
 수정된 문장만 제시하지 말고 실제 번역에 사용할 완성된 Prompt 전체만 반환하세요.
 

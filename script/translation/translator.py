@@ -1,13 +1,16 @@
-"""여러 TXT 파일의 Chunk 번역 흐름을 관리합니다."""
+"""파일 형식에 관계없이 TranslationUnit을 순차 번역합니다."""
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from script.config.translation_settings import DEFAULT_CHUNK_MAX_CHARS
 from script.providers.local_llm import LocalLLM
 from script.translation.file_loader import FileLoader
 from script.translation.file_writer import FileWriter
+from script.translation.formats import FormatHandler, create_handler
+from script.translation.formats.txt_handler import split_text_into_chunks
+from script.translation.placeholder import protect_placeholders, restore_placeholders
 from script.utils.exceptions import TranslationStopped
 
 
@@ -26,6 +29,7 @@ class TranslationSummary:
     stopped: int = 0
     stopped_file: str | None = None
     was_stopped: bool = False
+    by_format: dict[str, tuple[int, int]] = field(default_factory=dict)
 
 
 def build_translation_prompt(
@@ -45,39 +49,6 @@ def build_translation_prompt(
     )
 
 
-def split_text_into_chunks(
-    text: str,
-    max_chars: int = DEFAULT_CHUNK_MAX_CHARS,
-) -> list[str]:
-    if max_chars <= 0:
-        raise ValueError("max_chars는 0보다 커야 합니다.")
-    if not text:
-        return []
-
-    chunks: list[str] = []
-    current = ""
-
-    for original_line in text.splitlines(keepends=True):
-        line = original_line
-
-        if current and len(current) + len(line) > max_chars:
-            chunks.append(current)
-            current = ""
-
-        # 한 줄 자체가 제한을 넘는 경우에만 줄 중간을 분할합니다.
-        while len(line) > max_chars:
-            chunks.append(line[:max_chars])
-            line = line[max_chars:]
-
-        if line:
-            current += line
-
-    if current:
-        chunks.append(current)
-
-    return chunks
-
-
 class Translator:
     def __init__(
         self,
@@ -90,6 +61,8 @@ class Translator:
         selected_prompt: str | None = None,
         prompt_name: str = "기본 Prompt",
         stop_requested: Callable[[], bool] | None = None,
+        handlers: dict[Path, FormatHandler] | None = None,
+        file_paths: list[Path] | None = None,
     ) -> None:
         self.loader = loader
         self.local_llm = local_llm
@@ -100,12 +73,14 @@ class Translator:
         self.selected_prompt = selected_prompt
         self.prompt_name = prompt_name
         self.stop_requested = stop_requested or (lambda: False)
+        self.handlers = handlers or {}
+        self.file_paths = file_paths
 
     def translate_all(
         self,
         output_func: Callable[[str], None] = print,
     ) -> TranslationSummary:
-        input_files = self.loader.list_txt_files()
+        input_files = self.file_paths if self.file_paths is not None else self.loader.list_supported_files()
         self.writer.ensure_output_dir()
         total = len(input_files)
         succeeded = 0
@@ -114,9 +89,10 @@ class Translator:
         stopped = 0
         stopped_file: str | None = None
         was_stopped = False
+        counts: dict[str, list[int]] = {ext: [0, 0] for ext in (".txt", ".csv", ".json")}
 
         if total:
-            output_func(f"총 {total}개의 TXT 파일을 발견했습니다.")
+            output_func(f"총 {total}개의 번역 가능한 파일을 발견했습니다.")
 
         for index, input_path in enumerate(input_files, start=1):
             if self.writer.exists_for(input_path):
@@ -141,10 +117,12 @@ class Translator:
                 output_func(f"[{index}/{total}] 번역 실패: {input_path.name}")
                 output_func(f"원인: {error}")
                 failed += 1
+                counts[input_path.suffix.lower()][1] += 1
                 continue
 
             output_func(f"[{index}/{total}] 번역 완료: {input_path.name}")
             succeeded += 1
+            counts[input_path.suffix.lower()][0] += 1
 
             if index < total and self.stop_requested():
                 output_func("번역이 사용자 요청으로 중지되었습니다.")
@@ -159,31 +137,30 @@ class Translator:
             stopped=stopped,
             stopped_file=stopped_file,
             was_stopped=was_stopped,
+            by_format={ext: tuple(value) for ext, value in counts.items()},
         )
 
     def _translate_file(self, input_path: Path) -> str:
-        source_text = self.loader.read_text(input_path)
-        chunks = split_text_into_chunks(source_text, self.chunk_max_chars)
-        translated_chunks: list[str] = []
-
-        for index, chunk in enumerate(chunks):
+        handler = self.handlers.get(input_path)
+        if handler is None:
+            handler = create_handler(input_path, self.chunk_max_chars)
+            handler.load(input_path)
+        units = handler.extract_units()
+        if not units:
+            raise ValueError("번역 대상 텍스트가 없습니다.")
+        translations: dict[str, str] = {}
+        for index, unit in enumerate(units):
+            protected, placeholders = protect_placeholders(unit.text)
             translated = self.local_llm.generate(
                 build_translation_prompt(
-                    chunk,
+                    protected,
                     source_language=self.source_language,
                     target_language=self.target_language,
                     selected_prompt=self.selected_prompt,
                 )
             )
-            if not translated.endswith(("\r", "\n")):
-                if chunk.endswith("\r\n"):
-                    translated += "\r\n"
-                elif chunk.endswith("\n"):
-                    translated += "\n"
-                elif chunk.endswith("\r"):
-                    translated += "\r"
-            translated_chunks.append(translated)
-            if index < len(chunks) - 1 and self.stop_requested():
+            translations[unit.key] = restore_placeholders(translated, placeholders)
+            if index < len(units) - 1 and self.stop_requested():
                 raise TranslationStopped("사용자가 번역 중지를 요청했습니다.")
-
-        return "".join(translated_chunks)
+        handler.apply_translations(translations)
+        return handler.serialize()

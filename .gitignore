@@ -3,3 +3,5 @@ setting/api_key.json
 __pycache__/
 *.pyc
 .pytest_cache/
+setting/output/*
+!setting/output/.gitkeep

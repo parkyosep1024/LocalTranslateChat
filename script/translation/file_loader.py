@@ -21,6 +21,16 @@ class FileLoader:
         ]
         return sorted(files, key=lambda path: path.name.casefold())
 
+    def list_supported_files(self) -> list[Path]:
+        self.ensure_input_dir()
+        return sorted(
+            (
+                path for path in self.input_dir.iterdir()
+                if path.is_file() and path.suffix.lower() in {".txt", ".csv", ".json"}
+            ),
+            key=lambda path: path.name.casefold(),
+        )
+
     @staticmethod
     def read_text(path: Path) -> str:
         try:

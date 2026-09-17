@@ -54,8 +54,8 @@ class EchoLocalLLM:
 
 class SettingsTests(unittest.TestCase):
     def test_translation_paths_use_project_root(self) -> None:
-        self.assertEqual(INPUT_DIR, PROJECT_ROOT / "setting" / "input_txt")
-        self.assertEqual(OUTPUT_DIR, PROJECT_ROOT / "setting" / "output_txt")
+        self.assertEqual(INPUT_DIR, PROJECT_ROOT / "setting" / "input")
+        self.assertEqual(OUTPUT_DIR, PROJECT_ROOT / "setting" / "output")
 
     def test_reads_ollama_settings_from_env_file(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -368,7 +368,7 @@ class TranslatorTests(unittest.TestCase):
             self.assertEqual(exit_code, 0)
             self.assertTrue(settings.input_dir.is_dir())
             self.assertTrue(settings.output_dir.is_dir())
-            self.assertIn("번역할 TXT 파일이 없습니다.", outputs)
+            self.assertIn("번역할 TXT/CSV/JSON 파일이 없습니다.", outputs)
 
     def test_entry_point_reports_missing_model(self) -> None:
         outputs: list[str] = []

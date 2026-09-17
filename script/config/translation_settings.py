@@ -11,8 +11,8 @@ from script.utils.exceptions import ConfigurationError
 DEFAULT_OLLAMA_BASE_URL = "http://localhost:11434"
 DEFAULT_OLLAMA_TIMEOUT = 300.0
 DEFAULT_CHUNK_MAX_CHARS = 10_000
-INPUT_DIR = PROJECT_ROOT / "setting" / "input_txt"
-OUTPUT_DIR = PROJECT_ROOT / "setting" / "output_txt"
+INPUT_DIR = PROJECT_ROOT / "setting" / "input"
+OUTPUT_DIR = PROJECT_ROOT / "setting" / "output"
 
 
 @dataclass(frozen=True)

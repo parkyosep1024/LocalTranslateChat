@@ -3,7 +3,7 @@
 ## 1. 프로젝트 개요 (주제)
 
 외부 LLM API를 이용한 **일반 대화형 AI 챗봇**과
-로컬 LLM을 이용한 **TXT 파일 일괄 번역 기능**을 하나의 프로그램에서 제공하는 프로젝트입니다.
+로컬 LLM을 이용한 **TXT/CSV/JSON 파일 일괄 번역 기능**을 하나의 프로그램에서 제공하는 프로젝트입니다.
 
 일반적인 질문과 대화는 외부 LLM API를 이용하고,
 여러 파일을 번역하는 작업은 로컬 LLM을 이용하여 기능을 분리합니다.
@@ -17,9 +17,9 @@
 프로그램 실행
   ↓
 ┌──────────────────────────────┐
-│ 1. 일반 AI 채팅             │ → 외부 LLM API
-│ 2. TXT 파일 일괄 번역       │ → Local LLM
-│ 3. 번역 Prompt Preset 관리  │
+│ 1. 일반 AI 채팅              │ → 외부 LLM API
+│ 2. TXT/CSV/JSON 일괄 번역    │ → Local LLM
+│ 3. 번역 Prompt Preset 관리   │
 └──────────────────────────────┘
 ```
 
@@ -198,7 +198,7 @@ OLLAMA_BASE_URL=http://localhost:11434
 OLLAMA_TIMEOUT=300
 ```
 
-번역할 UTF-8 TXT 파일을 `setting/input_txt`에 넣고 다음 명령을 실행합니다.
+번역할 UTF-8 파일을 `setting/input`에 넣고 다음 명령을 실행합니다. 기존 2주차의 `setting/input_txt` 파일은 자동으로 이동하지 않으므로 계속 번역할 파일은 새 입력 폴더로 복사해 주세요.
 
 ```bash
 python -m script.translate_main
@@ -206,7 +206,7 @@ python -m script.translate_main
 
 실행 후 메뉴에서 `1. 번역`을 선택합니다.
 
-번역 결과는 원본과 같은 파일명으로 `setting/output_txt`에 저장됩니다. 하위 폴더와 TXT 이외의 파일은 처리하지 않으며, 결과 파일이 이미 있으면 건너뜁니다.
+번역 결과는 원본과 같은 파일명으로 `setting/output`에 저장됩니다. 하위 폴더와 TXT/CSV/JSON 이외의 파일은 처리하지 않으며, 결과 파일이 이미 있으면 건너뜁니다.
 
 파일은 기본적으로 최대 10,000자를 기준으로 가능한 한 줄바꿈 경계에서 나누어 순서대로 번역합니다. 모든 Chunk 번역이 성공한 경우에만 임시 파일을 최종 결과 파일로 교체하므로, 중간 번역에 실패한 불완전한 파일은 정상 결과로 남지 않습니다.
 
@@ -232,7 +232,7 @@ Local Translate Chat
 
 ### 번역 실행
 
-`1. 번역`을 선택하면 `setting/input_txt`의 일부 텍스트를 문자 기반으로 분석하여 원본 언어를 추정합니다. 지원 언어는 Korean, Japanese, English, Chinese이며 판별하기 어렵다면 Unknown으로 표시합니다. 감지 결과는 사용자가 그대로 사용하거나 직접 변경할 수 있습니다.
+`1. 번역`을 선택하면 `setting/input`에서 선택된 번역 대상 텍스트만 분석하여 원본 언어를 추정합니다. 지원 언어는 Korean, Japanese, English, Chinese이며 판별하기 어렵다면 Unknown으로 표시합니다. 감지 결과는 사용자가 그대로 사용하거나 직접 변경할 수 있습니다.
 
 목표 언어와 기본 Prompt 또는 저장된 Preset을 선택한 다음 Prompt 내용을 확인하고 번역을 시작합니다. Preset의 원본·목표 언어가 현재 설정과 다르면 경고 후 사용 여부를 다시 확인합니다.
 
@@ -242,11 +242,11 @@ Chunk 또는 파일 처리가 끝난 뒤 다음 안내에서 `q`를 입력하면
 계속하려면 Enter, 번역을 중지하려면 q를 입력하세요:
 ```
 
-현재 실행 중인 Ollama 요청은 완료되지만 다음 Chunk는 요청하지 않습니다. 중지된 파일은 `setting/output_txt`에 저장되지 않으며, 이전에 번역을 완료한 파일은 그대로 유지됩니다.
+현재 실행 중인 Ollama 요청은 완료되지만 다음 번역 단위는 요청하지 않습니다. 중지된 파일은 `setting/output`에 저장되지 않으며, 이전에 번역을 완료한 파일은 그대로 유지됩니다.
 
 ### Prompt 작성
 
-`2. Prompt 작성`을 선택하면 `setting/input_txt`의 여러 파일에서 파일당 최대 3,000자, 전체 최대 12,000자의 샘플을 가져옵니다. 기존 Gemini 설정을 이용해 문서 특성에 맞는 Translation Prompt Draft를 생성하며 샘플 원문 자체를 번역하도록 요청하지 않습니다.
+`2. Prompt 작성`을 선택하면 `setting/input`의 여러 파일에서 선택한 번역 대상만 파일당 최대 3,000자, 전체 최대 12,000자의 샘플로 가져옵니다. 기존 Gemini 설정을 이용해 문서 특성에 맞는 Translation Prompt Draft를 생성하며 샘플 원문 자체를 번역하도록 요청하지 않습니다.
 
 Draft를 확인한 다음 저장, 수정 요청 또는 취소할 수 있습니다. 수정 요청을 여러 번 반복할 수 있으며, 사용자가 최종 승인한 Prompt만 JSON Preset으로 저장합니다.
 
@@ -262,4 +262,18 @@ Preset에는 이름, 원본 언어, 목표 언어, 문서 유형, Prompt, 생성
 
 ```bash
 python -m script.translate_main
+```
+
+---
+
+## 9. Phase 4 — TXT/CSV/JSON 멀티포맷 번역
+
+`setting/input`에 세 형식을 함께 넣고 번역 메뉴를 실행할 수 있습니다. TXT는 기존 10,000자 청크 정책을 유지합니다. CSV는 표준 `csv` 파서로 읽고 사용자가 선택한 컬럼의 비어 있지 않은 셀만 번역합니다. JSON은 중첩 object/list를 탐색하고 사용자가 선택한 Key의 문자열 값만 번역합니다. 같은 구조의 파일에서는 컬럼/Key 선택을 재사용합니다.
+
+CSV의 선택하지 않은 컬럼, JSON의 선택하지 않은 Key와 숫자·boolean·null은 번역 모델에 전달하지 않습니다. `{player_name}`, `{0}`, `%s`, `%d`, `%1`, `${variable}`, `<color=red>`, `</color>`, `[ID_001]` 같은 Placeholder는 임시 토큰으로 보호합니다. 토큰의 순서가 바뀌거나 누락되면 해당 파일은 실패로 처리하고 결과를 저장하지 않습니다.
+
+결과는 `setting/output`에 동일한 이름과 확장자로 원자적으로 저장합니다. 기존 결과는 건너뛰고, 한 파일이 실패해도 다음 파일을 처리합니다. 실제 Ollama 서버 없이 전체 테스트를 실행하려면:
+
+```bash
+python -m unittest discover -s tests -v
 ```
