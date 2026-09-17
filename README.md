@@ -179,3 +179,87 @@ python -m script.main
 ```bash
 python -m unittest discover -s tests -v
 ```
+
+---
+
+## 7. 2주차 Local LLM TXT 번역 실행 방법
+
+2주차 범위인 Ollama 기반 TXT 파일 일괄 번역 기능은 기존 Gemini 챗봇과 분리된 실행 진입점을 사용합니다. Ollama를 설치하고 사용할 로컬 모델을 먼저 내려받아야 합니다.
+
+```bash
+ollama pull 사용할_모델명
+```
+
+프로젝트 루트의 `.env`에 다음 설정을 추가합니다. 모델명은 Python 코드에 직접 작성하지 않습니다.
+
+```env
+OLLAMA_MODEL=사용할_모델명
+OLLAMA_BASE_URL=http://localhost:11434
+OLLAMA_TIMEOUT=300
+```
+
+번역할 UTF-8 TXT 파일을 `setting/input_txt`에 넣고 다음 명령을 실행합니다.
+
+```bash
+python -m script.translate_main
+```
+
+실행 후 메뉴에서 `1. 번역`을 선택합니다.
+
+번역 결과는 원본과 같은 파일명으로 `setting/output_txt`에 저장됩니다. 하위 폴더와 TXT 이외의 파일은 처리하지 않으며, 결과 파일이 이미 있으면 건너뜁니다.
+
+파일은 기본적으로 최대 10,000자를 기준으로 가능한 한 줄바꿈 경계에서 나누어 순서대로 번역합니다. 모든 Chunk 번역이 성공한 경우에만 임시 파일을 최종 결과 파일로 교체하므로, 중간 번역에 실패한 불완전한 파일은 정상 결과로 남지 않습니다.
+
+2주차 단위 테스트는 실제 Ollama 서버나 모델을 사용하지 않고 실행할 수 있습니다.
+
+```bash
+python -m unittest tests.test_translation -v
+```
+
+---
+
+## 8. 3주차 Translation Prompt Preset
+
+`translate_main.py`는 다음 번역 전용 콘솔 메뉴를 제공합니다.
+
+```text
+Local Translate Chat
+
+1. 번역
+2. Prompt 작성
+3. 종료
+```
+
+### 번역 실행
+
+`1. 번역`을 선택하면 `setting/input_txt`의 일부 텍스트를 문자 기반으로 분석하여 원본 언어를 추정합니다. 지원 언어는 Korean, Japanese, English, Chinese이며 판별하기 어렵다면 Unknown으로 표시합니다. 감지 결과는 사용자가 그대로 사용하거나 직접 변경할 수 있습니다.
+
+목표 언어와 기본 Prompt 또는 저장된 Preset을 선택한 다음 Prompt 내용을 확인하고 번역을 시작합니다. Preset의 원본·목표 언어가 현재 설정과 다르면 경고 후 사용 여부를 다시 확인합니다.
+
+Chunk 또는 파일 처리가 끝난 뒤 다음 안내에서 `q`를 입력하면 번역을 중지합니다.
+
+```text
+계속하려면 Enter, 번역을 중지하려면 q를 입력하세요:
+```
+
+현재 실행 중인 Ollama 요청은 완료되지만 다음 Chunk는 요청하지 않습니다. 중지된 파일은 `setting/output_txt`에 저장되지 않으며, 이전에 번역을 완료한 파일은 그대로 유지됩니다.
+
+### Prompt 작성
+
+`2. Prompt 작성`을 선택하면 `setting/input_txt`의 여러 파일에서 파일당 최대 3,000자, 전체 최대 12,000자의 샘플을 가져옵니다. 기존 Gemini 설정을 이용해 문서 특성에 맞는 Translation Prompt Draft를 생성하며 샘플 원문 자체를 번역하도록 요청하지 않습니다.
+
+Draft를 확인한 다음 저장, 수정 요청 또는 취소할 수 있습니다. 수정 요청을 여러 번 반복할 수 있으며, 사용자가 최종 승인한 Prompt만 JSON Preset으로 저장합니다.
+
+Preset 저장 위치:
+
+```text
+prompts/presets/
+```
+
+Preset에는 이름, 원본 언어, 목표 언어, 문서 유형, Prompt, 생성 주체, 생성일 및 수정일이 저장됩니다. 같은 이름을 덮어쓸 때는 사용자 확인을 거치며 최초 생성일은 유지되고 수정일이 갱신됩니다.
+
+실행 명령:
+
+```bash
+python -m script.translate_main
+```

@@ -15,3 +15,19 @@ class APIRequestError(ChatbotError):
 
 class InvalidResponseError(ChatbotError):
     """외부 LLM API 응답에서 답변을 읽을 수 없을 때 발생합니다."""
+
+
+class LocalLLMError(ChatbotError):
+    """Ollama Local LLM 요청이 실패했을 때 발생합니다."""
+
+
+class FileProcessingError(ChatbotError):
+    """번역 파일을 읽거나 저장하지 못했을 때 발생합니다."""
+
+
+class PromptPresetError(ChatbotError):
+    """Prompt Preset을 읽거나 저장하지 못했을 때 발생합니다."""
+
+
+class TranslationStopped(ChatbotError):
+    """사용자가 Chunk 사이에서 번역 중지를 요청했을 때 발생합니다."""
