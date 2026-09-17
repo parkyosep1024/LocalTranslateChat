@@ -5,3 +5,5 @@ __pycache__/
 .pytest_cache/
 setting/output/*
 !setting/output/.gitkeep
+setting/schema_cache.json
+setting/schema_cache.json.tmp

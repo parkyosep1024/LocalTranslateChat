@@ -18,6 +18,14 @@ from script.translation.formats import FormatHandler, create_handler
 from script.translation.language_detector import LanguageDetector, SUPPORTED_LANGUAGES
 from script.translation.prompt_builder import GeminiPromptAI, PromptBuilder
 from script.translation.prompt_manager import PromptManager, PromptPreset
+from script.translation.schema_analyzer import (
+    GeminiSchemaAI,
+    SchemaAnalysis,
+    SchemaAnalyzer,
+    SchemaCache,
+    manual_analysis,
+    schema_fingerprint,
+)
 from script.translation.translator import (
     BASIC_TRANSLATION_PROMPT,
     TranslationSummary,
@@ -135,7 +143,11 @@ def run_interactive_translation(
         _display_empty_input(output_func)
         return
 
-    prepared = _prepare_handlers(input_files, writer, settings.chunk_max_chars, input_func, output_func)
+    prepared = _prepare_handlers(
+        input_files, writer, settings.chunk_max_chars, input_func, output_func,
+        analyzer_factory=_default_schema_analyzer,
+        schema_cache=SchemaCache(),
+    )
     if prepared is None:
         output_func("번역을 취소했습니다.")
         return
@@ -206,7 +218,9 @@ def run_prompt_creation(
         return
 
     prepared = _prepare_handlers(
-        input_files, None, translation_settings.chunk_max_chars, input_func, output_func
+        input_files, None, translation_settings.chunk_max_chars, input_func, output_func,
+        analyzer_factory=_default_schema_analyzer,
+        schema_cache=SchemaCache(),
     )
     if prepared is None:
         output_func("Prompt 작성을 취소했습니다.")
@@ -494,15 +508,17 @@ def _prepare_handlers(
     chunk_max_chars: int,
     input_func: InputFunction,
     output_func: OutputFunction,
+    analyzer_factory: Callable[[], SchemaAnalyzer] | None = None,
+    schema_cache: SchemaCache | None = None,
 ) -> tuple[dict[Path, FormatHandler], str] | None:
-    """사용자가 선택한 셀/값만 샘플링하고 파일별 Handler를 준비합니다."""
+    """CSV/JSON 추천을 확인받고, 선택된 값만 후속 단계에 전달합니다."""
     output_func("번역 가능한 파일을 발견했습니다.")
     for index, path in enumerate(files, 1):
         output_func(f"{index}. {path.name}")
     handlers: dict[Path, FormatHandler] = {}
     samples: list[str] = []
     remaining = 12_000
-    field_cache: dict[tuple[str, tuple[str, ...]], list[str]] = {}
+    session_results: dict[str, SchemaAnalysis] = {}
     for path in files:
         if writer is not None and writer.exists_for(path):
             continue
@@ -514,15 +530,40 @@ def _prepare_handlers(
                 if not fields:
                     output_func(f"{path.name}: 선택 가능한 문자열 컬럼/Key가 없습니다.")
                     continue
-                cache_key = (path.suffix.lower(), tuple(fields))
-                selected = field_cache.get(cache_key)
-                if selected is None:
+                kind = path.suffix.lower().lstrip(".")
+                fingerprint = schema_fingerprint(kind, fields)
+                analysis = session_results.get(fingerprint)
+                source = "이번 실행"
+                if analysis is None and schema_cache is not None:
+                    analysis = schema_cache.get(kind, fields)
+                    source = "저장된 Cache"
+                if analysis is None and analyzer_factory is not None:
+                    try:
+                        analysis = analyzer_factory().analyze(
+                            kind, fields, handler.sample_fields()
+                        )
+                        source = "Gemini"
+                    except Exception as error:
+                        output_func(f"{path.name}: AI 자동 분석을 사용할 수 없습니다 ({error}).")
+                if analysis is None:
+                    output_func("기존 수동 선택 방식으로 진행합니다.")
                     selected = _choose_fields(path, fields, input_func, output_func)
                     if selected is None:
                         return None
-                    field_cache[cache_key] = selected
+                    final_analysis = manual_analysis(fields, selected)
                 else:
-                    output_func(f"{path.name}: 같은 구조의 이전 선택을 재사용합니다.")
+                    confirmed = _confirm_schema_analysis(
+                        path, analysis, source, fields, input_func, output_func
+                    )
+                    if confirmed is None:
+                        return None
+                    selected, final_analysis = confirmed
+                session_results[fingerprint] = final_analysis
+                if schema_cache is not None:
+                    try:
+                        schema_cache.put(kind, fields, final_analysis)
+                    except OSError as error:
+                        output_func(f"{path.name}: Schema Cache 저장 실패 ({error})")
                 handler.select_fields(selected)
             units = handler.extract_units()
             handlers[path] = handler
@@ -534,6 +575,48 @@ def _prepare_handlers(
         except (OSError, ValueError, ChatbotError) as error:
             output_func(f"{path.name}: 설정 실패 ({error})")
     return handlers, "\n".join(samples)
+
+
+def _default_schema_analyzer() -> SchemaAnalyzer:
+    settings = Settings.from_env()
+    settings.validate()
+    return SchemaAnalyzer(GeminiSchemaAI(GeminiClient(settings)))
+
+
+def _confirm_schema_analysis(
+    path: Path,
+    analysis: SchemaAnalysis,
+    source: str,
+    fields: list[str],
+    input_func: InputFunction,
+    output_func: OutputFunction,
+) -> tuple[list[str], SchemaAnalysis] | None:
+    label = "CSV 컬럼" if path.suffix.lower() == ".csv" else "JSON Key"
+    output_func(f"{path.name}: {source} {label} 추천 결과")
+    output_func("번역 추천:")
+    for name in analysis.translate_fields:
+        output_func(f"✓ {name}")
+        output_func(f"  - {analysis.reasons[name]}")
+    output_func("무시 추천:")
+    for name in analysis.ignored_fields:
+        output_func(f"- {name}")
+        output_func(f"  - {analysis.reasons[name]}")
+    while True:
+        output_func("1. 이 설정으로 진행")
+        output_func("2. 직접 수정")
+        output_func("3. 취소")
+        choice = _read_choice({"1", "2", "3"}, input_func, output_func)
+        if choice in {None, "3"}:
+            return None
+        if choice == "1":
+            if analysis.translate_fields:
+                return list(analysis.translate_fields), analysis
+            output_func("번역 추천 항목이 없습니다. 직접 수정하거나 취소해 주세요.")
+            continue
+        selected = _choose_fields(path, fields, input_func, output_func)
+        if selected is None:
+            return None
+        return selected, analysis.with_selection(fields, selected)
 
 
 def _choose_fields(

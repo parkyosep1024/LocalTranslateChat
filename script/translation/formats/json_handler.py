@@ -43,6 +43,19 @@ class JsonHandler:
     def available_fields(self) -> list[str]:
         return list(dict.fromkeys(key for key, _, _ in self._walk(self.data)))
 
+    def sample_fields(
+        self, max_samples: int = 5, max_chars: int = 300
+    ) -> dict[str, list[str]]:
+        """중첩 object/list에서 같은 문자열 Key의 샘플을 모읍니다."""
+        if max_samples <= 0 or max_chars <= 0:
+            raise ValueError("샘플 제한은 0보다 커야 합니다.")
+        samples = {field: [] for field in self.available_fields()}
+        for field, _, text in self._walk(self.data):
+            value = text.strip()[:max_chars]
+            if value and value not in samples[field] and len(samples[field]) < max_samples:
+                samples[field].append(value)
+        return samples
+
     def select_fields(self, fields: list[str]) -> None:
         available = self.available_fields()
         if not fields or any(field not in available for field in fields):

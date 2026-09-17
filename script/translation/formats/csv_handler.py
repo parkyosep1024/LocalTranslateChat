@@ -49,6 +49,20 @@ class CsvHandler:
     def available_fields(self) -> list[str]:
         return self.header.copy()
 
+    def sample_fields(
+        self, max_samples: int = 5, max_chars: int = 300
+    ) -> dict[str, list[str]]:
+        """컬럼별로 비어 있지 않은 중복 없는 짧은 샘플을 수집합니다."""
+        if max_samples <= 0 or max_chars <= 0:
+            raise ValueError("샘플 제한은 0보다 커야 합니다.")
+        samples = {field: [] for field in self.header}
+        for row in self.rows:
+            for index, field in enumerate(self.header):
+                value = row[index].strip()[:max_chars]
+                if value and value not in samples[field] and len(samples[field]) < max_samples:
+                    samples[field].append(value)
+        return samples
+
     def select_fields(self, fields: list[str]) -> None:
         if not fields or any(field not in self.header for field in fields):
             raise ValueError("선택한 CSV 컬럼이 없거나 유효하지 않습니다.")
