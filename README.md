@@ -287,3 +287,30 @@ CSV/JSON 파일을 번역하거나 해당 파일의 Prompt를 작성할 때, Gem
 추천 이유와 함께 `1. 이 설정으로 진행 / 2. 직접 수정 / 3. 취소`가 표시됩니다. 직접 수정은 기존 번호 선택 UI를 사용합니다. AI 추천이나 캐시 결과도 사용자 확인 없이 적용하지 않습니다. Gemini 설정이 없거나 분석 응답이 잘못된 경우에는 수동 선택으로 전환합니다.
 
 확정한 선택은 `setting/schema_cache.json`에 저장됩니다. 동일한 컬럼/Key 구조에서는 Gemini 호출을 생략하지만 확인 화면은 다시 표시합니다. 캐시가 손상되면 무시하고 새 분석 또는 수동 선택으로 진행합니다. 캐시에는 파일 전체 내용이나 API Key를 저장하지 않으며 Git 추적에서도 제외합니다.
+
+---
+
+## 11. Phase 4.6 — Translation Prompt Library
+
+Prompt Preset은 원본 언어, 목표 언어, 문서 유형을 기준으로 계층적으로 저장됩니다.
+
+~~~text
+prompts/presets/
+├─ Japanese/
+│  └─ Korean/
+│     ├─ game_dialogue/
+│     │  └─ casual_dialogue.json
+│     └─ novel/
+│        └─ natural_novel.json
+└─ English/
+   └─ Korean/
+      └─ game_dialogue/
+~~~
+
+기존 prompts/presets/*.json 형태의 flat Preset도 계속 탐색합니다. 새로 저장하거나 수정한 Preset은 계층 구조를 사용합니다. 같은 범위 안의 같은 이름은 덮어쓰기 확인이 필요하지만, 언어 쌍이나 문서 유형이 다르면 같은 표시 이름을 사용할 수 있습니다.
+
+PromptManager는 언어·문서 유형별 목록과 우선순위 검색, 생성·수정·삭제·불러오기 기능을 제공합니다. 외부 UTF-8 TXT Prompt는 metadata를 지정해 Library Preset으로 가져올 수 있고, 프로젝트 형식의 JSON Preset도 가져올 수 있습니다. Preset은 metadata 전체를 JSON으로, Prompt 본문만 TXT로 내보낼 수 있습니다. 저장과 내보내기는 임시 파일을 이용해 원자적으로 처리합니다.
+
+번역에 성공하면 파일 내용의 SHA-256 Fingerprint와 사용한 Prompt 참조가 setting/prompt_usage.json에 기록됩니다. 파일명이 바뀌어도 내용이 같으면 이전 Prompt를 찾을 수 있습니다. CSV/JSON은 Schema Fingerprint도 함께 기록하며, 동일 파일을 우선한 뒤 언어 쌍·문서 유형·확장자·Schema가 일치하는 기존 Prompt를 규칙 기반으로 추천할 수 있습니다. TXT는 언어 쌍·문서 유형·.txt 확장자를 사용합니다.
+
+Usage Registry에는 원문이나 Prompt 본문, API Key를 저장하지 않습니다. 참조하던 Prompt가 삭제됐거나 Registry가 손상된 경우에는 Prompt Library의 일반 조건 검색으로 안전하게 전환합니다.

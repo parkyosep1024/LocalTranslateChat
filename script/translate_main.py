@@ -18,6 +18,7 @@ from script.translation.formats import FormatHandler, create_handler
 from script.translation.language_detector import LanguageDetector, SUPPORTED_LANGUAGES
 from script.translation.prompt_builder import GeminiPromptAI, PromptBuilder
 from script.translation.prompt_manager import PromptManager, PromptPreset
+from script.translation.prompt_usage import PromptUsageRegistry
 from script.translation.schema_analyzer import (
     GeminiSchemaAI,
     SchemaAnalysis,
@@ -47,6 +48,7 @@ def create_translator(
     stop_requested: Callable[[], bool] | None = None,
     handlers: dict[Path, FormatHandler] | None = None,
     file_paths: list[Path] | None = None,
+    on_file_succeeded: Callable[[Path], None] | None = None,
 ) -> Translator:
     return Translator(
         loader=FileLoader(settings.input_dir),
@@ -60,6 +62,7 @@ def create_translator(
         stop_requested=stop_requested,
         handlers=handlers,
         file_paths=file_paths,
+        on_file_succeeded=on_file_succeeded,
     )
 
 
@@ -166,17 +169,40 @@ def run_interactive_translation(
         return
 
     manager = PromptManager()
+    selected_presets: list[PromptPreset] = []
     selection = _select_and_confirm_prompt(
         manager,
         source_language,
         target_language,
         input_func,
         output_func,
+        selected_preset_callback=selected_presets.append,
     )
     if selection is None:
         output_func("번역을 취소했습니다.")
         return
     selected_prompt, prompt_name = selection
+    selected_preset = selected_presets[0] if selected_presets else None
+    usage_registry = PromptUsageRegistry()
+
+    def record_prompt_usage(path: Path) -> None:
+        if selected_preset is None:
+            return
+        handler = handlers.get(path)
+        schema = None
+        if handler is not None and path.suffix.lower() in {".csv", ".json"}:
+            schema = schema_fingerprint(
+                path.suffix.lower().lstrip("."), handler.available_fields()
+            )
+        usage_registry.record_success(
+            path,
+            manager,
+            selected_preset,
+            source_language,
+            target_language,
+            selected_preset.document_type,
+            schema,
+        )
 
     _display_translation_header(settings, output_func)
     stop_requested = _create_stop_checker(input_func, output_func)
@@ -188,6 +214,7 @@ def run_interactive_translation(
         prompt_name=prompt_name,
         stop_requested=stop_requested,
         handlers=handlers,
+        on_file_succeeded=record_prompt_usage,
     )
     summary = translator.translate_all(output_func)
 
@@ -247,6 +274,14 @@ def run_prompt_creation(
         return
     if not document_type:
         document_type = "general"
+
+    existing_matches = PromptManager().find_matching_presets(
+        source_language, target_language, document_type, exact=True
+    )
+    if existing_matches:
+        output_func("동일한 용도의 Prompt가 이미 있습니다.")
+        for preset in existing_matches:
+            output_func(f"- {preset.name}")
 
     try:
         gemini_settings = Settings.from_env()
@@ -313,7 +348,9 @@ def run_prompt_creation(
                 prompt=draft,
                 created_by="AI",
             )
-            existing = manager.find_by_name(name)
+            existing = manager.find_by_name(
+                name, source_language, target_language, document_type
+            )
             overwrite = False
             if existing is not None:
                 output_func("같은 이름의 Preset이 이미 있습니다.")
@@ -363,6 +400,7 @@ def _select_and_confirm_prompt(
     target_language: str,
     input_func: InputFunction,
     output_func: OutputFunction,
+    selected_preset_callback: Callable[[PromptPreset], None] | None = None,
 ) -> tuple[str | None, str] | None:
     while True:
         try:
@@ -374,7 +412,11 @@ def _select_and_confirm_prompt(
         output_func("사용 가능한 Prompt Preset")
         output_func("1. 기본 Prompt")
         for index, preset in enumerate(presets, start=2):
-            output_func(f"{index}. {preset.name}")
+            output_func(
+                f"{index}. {preset.name} "
+                f"({preset.source_language} → {preset.target_language}, "
+                f"{preset.document_type})"
+            )
         output_func("0. 취소")
 
         valid = {str(index) for index in range(1, len(presets) + 2)} | {"0"}
@@ -417,6 +459,8 @@ def _select_and_confirm_prompt(
         output_func("3. 취소")
         confirm = _read_choice({"1", "2", "3"}, input_func, output_func)
         if confirm == "1":
+            if preset is not None and selected_preset_callback is not None:
+                selected_preset_callback(preset)
             return (preset.prompt if preset is not None else None, prompt_name)
         if confirm in {None, "3"}:
             return None

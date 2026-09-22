@@ -7,3 +7,5 @@ setting/output/*
 !setting/output/.gitkeep
 setting/schema_cache.json
 setting/schema_cache.json.tmp
+setting/prompt_usage.json
+setting/prompt_usage.json.tmp

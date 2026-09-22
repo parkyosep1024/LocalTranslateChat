@@ -63,6 +63,7 @@ class Translator:
         stop_requested: Callable[[], bool] | None = None,
         handlers: dict[Path, FormatHandler] | None = None,
         file_paths: list[Path] | None = None,
+        on_file_succeeded: Callable[[Path], None] | None = None,
     ) -> None:
         self.loader = loader
         self.local_llm = local_llm
@@ -75,6 +76,7 @@ class Translator:
         self.stop_requested = stop_requested or (lambda: False)
         self.handlers = handlers or {}
         self.file_paths = file_paths
+        self.on_file_succeeded = on_file_succeeded
 
     def translate_all(
         self,
@@ -123,6 +125,11 @@ class Translator:
             output_func(f"[{index}/{total}] 번역 완료: {input_path.name}")
             succeeded += 1
             counts[input_path.suffix.lower()][0] += 1
+            if self.on_file_succeeded is not None:
+                try:
+                    self.on_file_succeeded(input_path)
+                except Exception as error:
+                    output_func(f"Prompt 사용 기록 저장 실패: {error}")
 
             if index < total and self.stop_requested():
                 output_func("번역이 사용자 요청으로 중지되었습니다.")
