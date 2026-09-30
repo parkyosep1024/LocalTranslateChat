@@ -54,6 +54,10 @@ class TranslationPageTest(unittest.TestCase):
         self.assertEqual(self.page.percent_label.text(), "0%")
         self.assertEqual(self.page.current_file_label.text(), "-")
         self.assertFalse(self.page.btn_stop.isEnabled())
+        # show하지 않은 widget의 isVisible()은 항상 False이므로,
+        # 실제 표시 후 빈 상태 안내가 보이는지 검증합니다.
+        self.page.show()
+        _app().processEvents()
         self.assertTrue(self.page.empty_file_label.isVisible())
 
     def test_no_dummy_progress_or_files(self) -> None:
@@ -346,6 +350,10 @@ class ChatPageEmptyTest(unittest.TestCase):
         page = ChatPage()
         self.assertEqual(page.message_count(), 0)
         self.assertEqual(page.model_value.text(), "-")
+        # show하지 않은 widget의 isVisible()은 항상 False이므로,
+        # 실제 표시 후 빈 상태 안내가 보이는지 검증합니다.
+        page.show()
+        _app().processEvents()
         self.assertTrue(page.empty_chat_label.isVisible())
 
 
@@ -360,6 +368,18 @@ class MainWindowLifecycleTest(unittest.TestCase):
     def tearDown(self) -> None:
         for window in self.windows:
             try:
+                # 백그라운드 Ollama 확인이 끝나기 전에 닫고 종료하면
+                # 진행 중인 QThread와 함께 fail-fast crash가 납니다.
+                # 상태 확정 + 스레드 종료 신호 전달까지 기다린 뒤 닫습니다
+                # (이미 끝났으면 즉시 반환).
+                self.wait_for(
+                    lambda w=window: w._ollama_connected is not None,
+                    timeout_ms=10000,
+                )
+                self.wait_for(
+                    lambda w=window: len(w._threads) == 0,
+                    timeout_ms=10000,
+                )
                 window.close()
             except Exception:
                 pass
@@ -372,17 +392,38 @@ class MainWindowLifecycleTest(unittest.TestCase):
         self.windows.append(window)
         return window
 
-    def wait_for(self, condition, timeout_ms: int = 8000) -> bool:
+    def wait_for(self, condition, timeout_ms: int = 3000) -> bool:
+        """조건이 만족되면 즉시 True, timeout이면 False를 반환합니다.
+
+        짧은 polling QTimer로 확인하므로 busy loop가 없고,
+        sleep으로 GUI event loop를 막지 않습니다.
+        """
+        if condition():
+            return True
+
         loop = QEventLoop()
-        timer = QTimer()
-        timer.setSingleShot(True)
-        timer.timeout.connect(loop.quit)
-        timer.start(timeout_ms)
-        while not condition():
-            loop.exec()
-            if not timer.isActive():
-                break
-        timer.stop()
+
+        poll = QTimer()
+        poll.setInterval(10)
+
+        timeout = QTimer()
+        timeout.setSingleShot(True)
+
+        def check() -> None:
+            if condition():
+                loop.quit()
+
+        poll.timeout.connect(check)
+        timeout.timeout.connect(loop.quit)
+
+        poll.start()
+        timeout.start(timeout_ms)
+
+        loop.exec()
+
+        poll.stop()
+        timeout.stop()
+
         return condition()
 
     def test_constructs_without_attribute_error(self) -> None:
