@@ -8,11 +8,14 @@ from pathlib import Path
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 try:
+    from PySide6.QtCore import QEventLoop, QThread, QTimer
     from PySide6.QtWidgets import QApplication
 
+    from script.config.translation_settings import TranslationSettings
     from script.gui.main_window import (
         collect_detection_sample,
         detect_source_language,
+        find_unmatched_structured_files,
         resolve_fields_for_handler,
         resolve_prompt_selection,
     )
@@ -344,6 +347,215 @@ class ChatPageEmptyTest(unittest.TestCase):
         self.assertEqual(page.message_count(), 0)
         self.assertEqual(page.model_value.text(), "-")
         self.assertTrue(page.empty_chat_label.isVisible())
+
+
+@unittest.skipUnless(PYSIDE_AVAILABLE, "PySide6이 필요합니다.")
+class MainWindowLifecycleTest(unittest.TestCase):
+    """BUG1~4 회귀 테스트: 생성, ref 정리, 재시작, schema 검증, 상태 확인 전 차단."""
+
+    def setUp(self) -> None:
+        _app()
+        self.windows: list = []
+
+    def tearDown(self) -> None:
+        for window in self.windows:
+            try:
+                window.close()
+            except Exception:
+                pass
+        _app().processEvents()
+
+    def make_window(self):
+        from script.gui.main_window import MainWindow
+
+        window = MainWindow()
+        self.windows.append(window)
+        return window
+
+    def wait_for(self, condition, timeout_ms: int = 8000) -> bool:
+        loop = QEventLoop()
+        timer = QTimer()
+        timer.setSingleShot(True)
+        timer.timeout.connect(loop.quit)
+        timer.start(timeout_ms)
+        while not condition():
+            loop.exec()
+            if not timer.isActive():
+                break
+        timer.stop()
+        return condition()
+
+    def test_constructs_without_attribute_error(self) -> None:
+        # BUG1: _threads/_workers가 _check_ollama_status보다 먼저 있어야 합니다.
+        window = self.make_window()
+        self.assertIsInstance(window._threads, set)
+        self.assertIsInstance(window._workers, set)
+        self.assertIsNotNone(window._status_thread)
+
+    def test_ollama_checking_blocks_translation_start(self) -> None:
+        # BUG4: _ollama_connected is None(확인 중)이면 시작하지 않습니다.
+        window = self.make_window()
+        window.translation_settings = TranslationSettings(model="test-model")
+        window._ollama_connected = None
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "a.txt"
+            target.write_text("hello world, hello again", encoding="utf-8")
+            window.translation_page.add_file_path(target)
+            window._on_translation_start()
+            self.assertIn("확인 중", window.translation_page.status_label.text())
+            self.assertIsNone(window._translation_worker)
+            self.assertNotEqual(window.translation_page._state, "running")
+
+    def test_mismatched_schema_blocks_start(self) -> None:
+        # BUG3: a.csv(id/text) 선택값이 b.json(speaker/dialogue)에 없으면 차단합니다.
+        window = self.make_window()
+        window.translation_settings = TranslationSettings(model="test-model")
+        window._ollama_connected = True
+        window._ollama_model_found = True
+        with tempfile.TemporaryDirectory() as tmp:
+            csv_path = Path(tmp) / "a.csv"
+            csv_path.write_text("id,text\n1,hello\n", encoding="utf-8")
+            json_path = Path(tmp) / "b.json"
+            json_path.write_text('{"speaker": "A", "dialogue": "hi"}', encoding="utf-8")
+            window.translation_page.add_file_path(csv_path)
+            window.translation_page.add_file_path(json_path)
+            window._on_translation_start()
+            self.assertIn("b.json", window.translation_page.status_label.text())
+            self.assertIsNone(window._translation_worker)
+            self.assertNotEqual(window.translation_page._state, "running")
+
+    def test_find_unmatched_structured_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            csv_path = Path(tmp) / "a.csv"
+            csv_path.write_text("id,text\n1,hello\n", encoding="utf-8")
+            json_path = Path(tmp) / "b.json"
+            json_path.write_text('{"speaker": "A", "dialogue": "hi"}', encoding="utf-8")
+            offenders = find_unmatched_structured_files(
+                [csv_path, json_path], ["id", "text"]
+            )
+            self.assertEqual(offenders, [json_path])
+            # 같은 schema면 차단하지 않습니다.
+            csv2 = Path(tmp) / "c.csv"
+            csv2.write_text("id,text\n2,bye\n", encoding="utf-8")
+            self.assertEqual(
+                find_unmatched_structured_files([csv_path, csv2], ["text"]), []
+            )
+            # TXT는 검사 대상이 아닙니다.
+            txt = Path(tmp) / "n.txt"
+            txt.write_text("plain", encoding="utf-8")
+            self.assertEqual(
+                find_unmatched_structured_files([txt, json_path], ["dialogue"]), []
+            )
+
+    def test_chat_completes_clears_refs_and_restarts(self) -> None:
+        # BUG2: Chat 1회 완료 후 reference가 정리되고 다시 시작 가능해야 합니다.
+        window = self.make_window()
+
+        class FakeEngine:
+            def chat(self, message: str) -> str:
+                return "echo:" + message
+
+            def clear_history(self) -> None:
+                pass
+
+        window.chat_engine = FakeEngine()
+        window.chat_page.input.setPlainText("hi")
+        window.chat_page._emit_send()
+        self.assertTrue(
+            self.wait_for(lambda: window.chat_page.message_count() == 2),
+            "AI 답변을 받지 못했습니다.",
+        )
+        self.assertTrue(self.wait_for(lambda: window._chat_thread is None))
+        self.assertIsNone(window._chat_worker)
+        self.assertTrue(window.chat_page.send_button.isEnabled())
+        # 두 번째 Chat이 삭제된 객체 없이 시작되어야 합니다.
+        window.chat_page.input.setPlainText("again")
+        window.chat_page._emit_send()
+        self.assertTrue(
+            self.wait_for(lambda: window.chat_page.message_count() == 4),
+            "두 번째 Chat이 시작되지 않았습니다.",
+        )
+        self.assertTrue(self.wait_for(lambda: window._chat_thread is None))
+
+    def _launch_test_translation(self, window, factory):
+        worker = TranslationWorker(factory, [])
+        thread = QThread()
+        worker.moveToThread(thread)
+        done: list[str] = []
+        thread.started.connect(worker.run)
+        worker.finished.connect(window._on_translation_finished)
+        worker.failed.connect(window._on_translation_failed)
+        worker.stopped.connect(window._on_translation_stopped)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.stopped.connect(thread.quit)
+        worker.finished.connect(lambda _s: done.append("finished"))
+        worker.failed.connect(lambda _e: done.append("failed"))
+        worker.stopped.connect(lambda: done.append("stopped"))
+        window._launch(
+            thread,
+            worker,
+            {"_translation_thread": thread, "_translation_worker": worker},
+        )
+        window._translation_thread = thread
+        window._translation_worker = worker
+        thread.start()
+        return done
+
+    @staticmethod
+    def _summary_factory(stopped: bool = False, fail: bool = False):
+        class FakeTranslator:
+            def __init__(self, stop_requested=None, on_progress=None, file_paths=None) -> None:
+                pass
+
+            def translate_all(self, output_func=print):
+                if fail:
+                    raise RuntimeError("llm down")
+
+                class Summary:
+                    was_stopped = stopped
+                    succeeded = 0 if stopped else 1
+                    failed = 0
+
+                return Summary()
+
+        return FakeTranslator
+
+    def test_translation_success_clears_refs(self) -> None:
+        window = self.make_window()
+        done = self._launch_test_translation(window, self._summary_factory())
+        self.assertTrue(self.wait_for(lambda: len(done) == 1))
+        self.assertEqual(done, ["finished"])
+        self.assertTrue(self.wait_for(lambda: window._translation_thread is None))
+        self.assertIsNone(window._translation_worker)
+        self.assertEqual(window.translation_page.state_badge.text(), "완료")
+
+    def test_translation_stopped_then_restartable(self) -> None:
+        window = self.make_window()
+        done = self._launch_test_translation(window, self._summary_factory(stopped=True))
+        self.assertTrue(self.wait_for(lambda: len(done) == 1))
+        self.assertEqual(done, ["stopped"])
+        self.assertTrue(self.wait_for(lambda: window._translation_thread is None))
+        self.assertIsNone(window._translation_worker)
+        # 중지 상태가 완료 100%로 덮이지 않아야 합니다.
+        self.assertEqual(window.translation_page.state_badge.text(), "중지됨")
+        self.assertLess(window.translation_page.progress.value(), 100)
+        # 중지 후 다시 시작 가능해야 합니다.
+        done2 = self._launch_test_translation(window, self._summary_factory())
+        self.assertTrue(self.wait_for(lambda: len(done2) == 1))
+        self.assertEqual(done2, ["finished"])
+        self.assertEqual(window.translation_page.state_badge.text(), "완료")
+
+    def test_translation_failed_then_retryable(self) -> None:
+        window = self.make_window()
+        done = self._launch_test_translation(window, self._summary_factory(fail=True))
+        self.assertTrue(self.wait_for(lambda: len(done) == 1))
+        self.assertEqual(done, ["failed"])
+        self.assertTrue(self.wait_for(lambda: window._translation_thread is None))
+        self.assertIsNone(window._translation_worker)
+        done2 = self._launch_test_translation(window, self._summary_factory())
+        self.assertTrue(self.wait_for(lambda: len(done2) == 1))
+        self.assertEqual(done2, ["finished"])
 
 
 if __name__ == "__main__":

@@ -119,6 +119,34 @@ def resolve_fields_for_handler(
     return [name for name in available if name in chosen]
 
 
+def find_unmatched_structured_files(
+    file_paths: list[Path], selected_fields: list[str]
+) -> list[Path]:
+    """현재 선택 field와 겹치는 번역 대상이 없는 CSV/JSON을 반환합니다.
+
+    파일마다 schema가 다를 수 있으므로(예: a.csv의 id/text와
+    b.json의 speaker/dialogue) 첫 파일 기준으로 전체를 가정하지 않고
+    번역 시작 전에 모든 구조화 파일을 검증합니다.
+    전체 fallback이나 잘못된 field 자동 번역은 하지 않습니다.
+    향후 파일별 field 선택(Schema Analyzer 연동)으로 확장하기 위한 검사 지점입니다.
+    """
+    selected = set(selected_fields or [])
+    offenders: list[Path] = []
+    for path in file_paths:
+        if path.suffix.lower() not in {".csv", ".json"}:
+            continue
+        try:
+            handler = create_handler(path)
+            handler.load(path)
+            available = handler.available_fields()
+        except Exception:
+            # 읽을 수 없는 파일은 시작 후 per-file 실패로 처리합니다.
+            continue
+        if not any(name in selected for name in available):
+            offenders.append(path)
+    return offenders
+
+
 class MainWindow(QMainWindow):
     """1200x800 기준 데스크톱 셸입니다. OS 네이티브 타이틀바를 사용합니다."""
 
@@ -132,6 +160,19 @@ class MainWindow(QMainWindow):
         self.prompt_manager = PromptManager()
         self.translation_settings: TranslationSettings | None = self._load_translation_settings()
         self._prompt_presets: list[PromptPreset] = []
+
+        # thread/worker 추적 변수를 먼저 생성합니다.
+        # (_check_ollama_status → _launch에서 사용하므로 순서가 바뀌면 crash합니다.)
+        self._threads: set[QThread] = set()
+        self._workers: set[QObject] = set()
+        self._chat_thread: QThread | None = None
+        self._chat_worker: ChatWorker | None = None
+        self._status_thread: QThread | None = None
+        self._translation_thread: QThread | None = None
+        self._translation_worker: TranslationWorker | None = None
+
+        self._ollama_connected: bool | None = None
+        self._ollama_model_found: bool | None = None
 
         root = QWidget()
         root.setObjectName("AppRoot")
@@ -172,26 +213,30 @@ class MainWindow(QMainWindow):
         self._refresh_translation_prompts()
 
         # Ollama 상태 백그라운드 확인 (GUI 시작을 막지 않음)
-        self._ollama_connected: bool | None = None
-        self._ollama_model_found: bool | None = None
         self._check_ollama_status()
 
-        self._threads: set[QThread] = set()
-        self._workers: set[QObject] = set()
-        self._chat_thread: QThread | None = None
-        self._chat_worker: ChatWorker | None = None
-        self._status_thread: QThread | None = None
-        self._translation_thread: QThread | None = None
-        self._translation_worker: TranslationWorker | None = None
+    def _launch(self, thread: QThread, worker: QObject, clear_refs: dict = None) -> None:
+        """thread 실행 중 GC 방지 + 종료 후 정리 + 재시작 가능하도록 추적합니다.
 
-    def _launch(self, thread: QThread, worker: QObject) -> None:
-        """thread 실행 중 GC 방지 + 종료 후 정리 + 재시작 가능하도록 추적합니다."""
+        clear_refs {attribute: 객체}는 thread 종료 시 일치하는 객체만 None으로
+        정리합니다. (삭제된 C++ 객체에 isRunning()을 호출하는 사고를 방지)
+        """
         self._threads.add(thread)
         self._workers.add(worker)
         thread.finished.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
         thread.finished.connect(lambda _t=thread: self._threads.discard(_t))
         thread.finished.connect(lambda _w=worker: self._workers.discard(_w))
+        for attr, obj in (clear_refs or {}).items():
+            thread.finished.connect(lambda _o=obj, _a=attr: self._clear_ref(_a, _o))
+
+    def _clear_ref(self, attr: str, current: object) -> None:
+        """종료된 thread/worker reference를 안전하게 None으로 정리합니다."""
+        try:
+            if getattr(self, attr, None) is current:
+                setattr(self, attr, None)
+        except Exception:
+            pass
 
     def closeEvent(self, event) -> None:
         """앱 종료 시 running thread 때문에 crash하지 않도록 정리합니다."""
@@ -260,7 +305,7 @@ class MainWindow(QMainWindow):
         worker.failed.connect(self._on_chat_failed)
         worker.finished.connect(thread.quit)
         worker.failed.connect(thread.quit)
-        self._launch(thread, worker)
+        self._launch(thread, worker, {"_chat_thread": thread, "_chat_worker": worker})
         self._chat_thread = thread
         self._chat_worker = worker
         thread.start()
@@ -299,7 +344,7 @@ class MainWindow(QMainWindow):
         thread.started.connect(worker.run)
         worker.finished.connect(self._on_ollama_status)
         worker.finished.connect(thread.quit)
-        self._launch(thread, worker)
+        self._launch(thread, worker, {"_status_thread": thread})
         self._status_thread = thread
         thread.start()
 
@@ -382,6 +427,11 @@ class MainWindow(QMainWindow):
         if not file_paths:
             self.translation_page.set_status("번역할 파일을 먼저 추가해주세요.")
             return
+        if self._ollama_connected is None:
+            self.translation_page.set_status(
+                "로컬 모델 상태를 확인 중입니다. 잠시 후 다시 시도해주세요."
+            )
+            return
         if self._ollama_connected is False:
             self.translation_page.set_status(
                 "Ollama 서버에 연결할 수 없습니다. Ollama가 실행 중인지 확인해주세요."
@@ -402,6 +452,15 @@ class MainWindow(QMainWindow):
             self.translation_page.set_status(
                 "CSV/JSON 번역 대상 field를 1개 이상 선택해주세요. "
                 "선택하지 않은 컬럼/Key는 번역하지 않습니다."
+            )
+            return
+        # 서로 다른 schema의 파일이 섞여 있으면 조용히 오번역하지 않고 시작을 막습니다.
+        unmatched = find_unmatched_structured_files(file_paths, selected_fields)
+        if unmatched:
+            names = "\n".join(f"· {path.name}" for path in unmatched)
+            self.translation_page.set_status(
+                "다음 파일에 선택한 field와 일치하는 번역 대상이 없습니다:\n"
+                f"{names}\n번역을 시작하지 않았습니다."
             )
             return
         if self._translation_thread is not None and self._translation_thread.isRunning():
@@ -452,7 +511,10 @@ class MainWindow(QMainWindow):
         worker.finished.connect(thread.quit)
         worker.failed.connect(thread.quit)
         worker.stopped.connect(thread.quit)
-        self._launch(thread, worker)
+        self._launch(
+            thread, worker,
+            {"_translation_thread": thread, "_translation_worker": worker},
+        )
         self._translation_thread = thread
         self._translation_worker = worker
         thread.start()
