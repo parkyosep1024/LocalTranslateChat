@@ -84,6 +84,59 @@ class HandlerTests(unittest.TestCase):
             self.assertTrue(handler.serialize().startswith("\ufeffid;text"))
             self.assertIn("1;안녕하세요", handler.serialize())
 
+    def test_csv_without_bom_writes_without_bom_and_round_trips_unicode(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "input"
+            target = root / "output"
+            source.mkdir()
+            path = source / "dialogue.csv"
+            path.write_bytes(
+                'id,text,note\r\n1,"안녕,\n세계",こんにちは\r\n'.encode("utf-8")
+            )
+            handler = CsvHandler()
+            handler.load(path)
+            handler.select_fields(["text", "note"])
+            units = handler.extract_units()
+            handler.apply_translations({unit.key: unit.text for unit in units})
+
+            output_path = FileWriter(target).write(path, handler.serialize())
+            output_bytes = output_path.read_bytes()
+
+            self.assertFalse(output_bytes.startswith(b"\xef\xbb\xbf"))
+            rows = list(
+                csv.reader(io.StringIO(output_bytes.decode("utf-8"), newline=""))
+            )
+            self.assertEqual(rows[1], ["1", "안녕,\n세계", "こんにちは"])
+            self.assertIn(b"\r\n", output_bytes)
+
+    def test_csv_with_bom_writes_with_bom_and_round_trips_unicode(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "input"
+            target = root / "output"
+            source.mkdir()
+            path = source / "dialogue.csv"
+            content = "id;text\n1;안녕하세요\n2;こんにちは\n"
+            path.write_bytes(b"\xef\xbb\xbf" + content.encode("utf-8"))
+            handler = CsvHandler()
+            handler.load(path)
+            handler.select_fields(["text"])
+            units = handler.extract_units()
+            handler.apply_translations({unit.key: unit.text for unit in units})
+
+            output_path = FileWriter(target).write(path, handler.serialize())
+            output_bytes = output_path.read_bytes()
+
+            self.assertTrue(output_bytes.startswith(b"\xef\xbb\xbf"))
+            rows = list(
+                csv.reader(
+                    io.StringIO(output_bytes.decode("utf-8-sig"), newline=""),
+                    delimiter=";",
+                )
+            )
+            self.assertEqual(rows[1:], [["1", "안녕하세요"], ["2", "こんにちは"]])
+
     def test_csv_invalid_header_and_row_shape(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "bad.csv"

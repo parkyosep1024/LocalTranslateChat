@@ -104,8 +104,10 @@ def choose_language(
     output_func("0. 취소")
 
     choice = _read_choice(set(SUPPORTED_LANGUAGES) | {"0"}, input_func, output_func)
-    return None if choice in {None, "0"} else SUPPORTED_LANGUAGES[choice]
+    if choice is None or choice == "0":
+        return None
 
+    return SUPPORTED_LANGUAGES[choice]
 
 def confirm_source_language(
     detected_language: str,
@@ -205,14 +207,13 @@ def run_interactive_translation(
         )
 
     _display_translation_header(settings, output_func)
-    stop_requested = _create_stop_checker(input_func, output_func)
     translator = create_translator(
         settings,
         source_language=source_language,
         target_language=target_language,
         selected_prompt=selected_prompt,
         prompt_name=prompt_name,
-        stop_requested=stop_requested,
+        stop_requested=lambda: False,
         handlers=handlers,
         on_file_succeeded=record_prompt_usage,
     )
@@ -466,23 +467,6 @@ def _select_and_confirm_prompt(
             return None
 
 
-def _create_stop_checker(
-    input_func: InputFunction,
-    output_func: OutputFunction,
-) -> Callable[[], bool]:
-    def check() -> bool:
-        try:
-            answer = input_func(
-                "계속하려면 Enter, 번역을 중지하려면 q를 입력하세요: "
-            ).strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            output_func("")
-            return True
-        return answer in {"q", "quit", "/stop", "stop"}
-
-    return check
-
-
 def _read_choice(
     valid_choices: set[str],
     input_func: InputFunction,
@@ -686,7 +670,11 @@ def _choose_fields(
 
 
 def main() -> int:
-    return run_menu()
+    try:
+        return run_menu()
+    except KeyboardInterrupt:
+        print("\n프로그램을 종료합니다.")
+        return 130
 
 
 if __name__ == "__main__":

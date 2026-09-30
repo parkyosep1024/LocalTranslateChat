@@ -5,7 +5,7 @@ from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
 
 from script.chat.chat_engine import ChatEngine
 from script.chat.history import ConversationHistory
@@ -31,6 +31,13 @@ class FakeResponse:
 
     def __exit__(self, *_args: object) -> None:
         return None
+
+
+def make_http_error(status: int, detail: str = "temporary", **headers: str) -> HTTPError:
+    body = io.BytesIO(
+        json.dumps({"error": {"message": detail}}).encode("utf-8")
+    )
+    return HTTPError("https://example.test", status, "error", headers, body)
 
 
 class RecordingClient:
@@ -184,6 +191,92 @@ class GeminiTests(unittest.TestCase):
 
         with self.assertRaisesRegex(APIRequestError, "연결할 수 없습니다"):
             client.create_chat_completion([])
+
+    def test_retries_503_then_succeeds_without_real_sleep(self) -> None:
+        events = [
+            make_http_error(503),
+            FakeResponse({"candidates": [{"content": {"parts": [{"text": "ok"}]}}]}),
+        ]
+        delays: list[float] = []
+
+        def opener(*_args, **_kwargs):
+            event = events.pop(0)
+            if isinstance(event, Exception):
+                raise event
+            return event
+
+        client = GeminiClient(
+            Settings(api_key="test-key", model="gemini-test"),
+            opener=opener,
+            sleep_func=delays.append,
+        )
+
+        self.assertEqual(client.create_chat_completion([]), "ok")
+        self.assertEqual(delays, [1.0])
+
+    def test_retries_429_then_succeeds_and_honors_retry_after(self) -> None:
+        events = [
+            make_http_error(429, **{"Retry-After": "3"}),
+            FakeResponse({"candidates": [{"content": {"parts": [{"text": "ok"}]}}]}),
+        ]
+        delays: list[float] = []
+
+        def opener(*_args, **_kwargs):
+            event = events.pop(0)
+            if isinstance(event, Exception):
+                raise event
+            return event
+
+        client = GeminiClient(
+            Settings(api_key="test-key", model="gemini-test"),
+            opener=opener,
+            sleep_func=delays.append,
+        )
+
+        self.assertEqual(client.create_chat_completion([]), "ok")
+        self.assertEqual(delays, [3.0])
+
+    def test_persistent_503_raises_after_three_attempts(self) -> None:
+        calls = 0
+        delays: list[float] = []
+
+        def opener(*_args, **_kwargs):
+            nonlocal calls
+            calls += 1
+            raise make_http_error(503, "high demand")
+
+        client = GeminiClient(
+            Settings(api_key="test-key", model="gemini-test"),
+            opener=opener,
+            sleep_func=delays.append,
+        )
+
+        with self.assertRaisesRegex(APIRequestError, "HTTP 503.*high demand"):
+            client.create_chat_completion([])
+
+        self.assertEqual(calls, 3)
+        self.assertEqual(delays, [1.0, 2.0])
+
+    def test_400_fails_immediately_without_retry(self) -> None:
+        calls = 0
+        delays: list[float] = []
+
+        def opener(*_args, **_kwargs):
+            nonlocal calls
+            calls += 1
+            raise make_http_error(400, "bad request")
+
+        client = GeminiClient(
+            Settings(api_key="test-key", model="gemini-test"),
+            opener=opener,
+            sleep_func=delays.append,
+        )
+
+        with self.assertRaisesRegex(APIRequestError, "HTTP 400.*bad request"):
+            client.create_chat_completion([])
+
+        self.assertEqual(calls, 1)
+        self.assertEqual(delays, [])
 
 
 class CliTests(unittest.TestCase):

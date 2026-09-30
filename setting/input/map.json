@@ -1,0 +1,20 @@
+[
+  {
+    "id": "dialogue_001",
+    "speaker": "Alice",
+    "text": "こんにちは。",
+    "voice": "voice_001.ogg"
+  },
+  {
+    "id": "dialogue_002",
+    "speaker": "Bob",
+    "text": "今日はいい天気ですね。",
+    "voice": "voice_002.ogg"
+  },
+  {
+    "id": "dialogue_003",
+    "speaker": "Alice",
+    "text": "{player_name}さん、一緒に行きましょう。",
+    "voice": "voice_003.ogg"
+  }
+]

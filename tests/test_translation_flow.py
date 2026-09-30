@@ -1,10 +1,18 @@
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
-from script.translate_main import _select_and_confirm_prompt, run_menu
+from script.config.translation_settings import TranslationSettings
+from script.translate_main import (
+    _select_and_confirm_prompt,
+    main,
+    run_interactive_translation,
+    run_menu,
+)
 from script.translation.file_loader import FileLoader
 from script.translation.file_writer import FileWriter
+from script.translation.formats import create_handler
 from script.translation.prompt_manager import PromptManager
 from script.translation.translator import (
     Translator,
@@ -22,6 +30,78 @@ class RecordingLocalLLM:
 
 
 class TranslationFlowTests(unittest.TestCase):
+    def test_cli_translates_multiple_units_and_files_without_intermediate_input(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            input_dir = root / "input"
+            output_dir = root / "output"
+            input_dir.mkdir()
+            csv_path = input_dir / "001.csv"
+            json_path = input_dir / "002.json"
+            txt_path = input_dir / "003.txt"
+            csv_path.write_text("id,text\n1,hello\n2,bye\n", encoding="utf-8")
+            json_path.write_text('{"lines":["hello","bye"]}', encoding="utf-8")
+            txt_path.write_text("1111\n2222", encoding="utf-8")
+            settings = TranslationSettings(
+                model="test-model",
+                chunk_max_chars=5,
+                input_dir=input_dir,
+                output_dir=output_dir,
+            )
+            handlers = {}
+            for path, fields in ((csv_path, ["text"]), (json_path, ["lines"])):
+                handler = create_handler(path, settings.chunk_max_chars)
+                handler.load(path)
+                handler.select_fields(fields)
+                handlers[path] = handler
+            txt_handler = create_handler(txt_path, settings.chunk_max_chars)
+            txt_handler.load(txt_path)
+            handlers[txt_path] = txt_handler
+            inputs = iter(["1", "1", "1", "1"])
+            prompts: list[str] = []
+            translation_started = False
+
+            def input_func(prompt: str) -> str:
+                if translation_started:
+                    raise AssertionError("번역 시작 후 input()이 호출되었습니다.")
+                prompts.append(prompt)
+                return next(inputs)
+
+            def generate_translation(prompt: str) -> str:
+                nonlocal translation_started
+                translation_started = True
+                return prompt.split("[원문]\n", 1)[1].upper()
+
+            with (
+                patch(
+                    "script.translate_main.TranslationSettings.from_env",
+                    return_value=settings,
+                ),
+                patch(
+                    "script.translate_main._prepare_handlers",
+                    return_value=(handlers, "hello bye"),
+                ),
+                patch(
+                    "script.translate_main.PromptManager",
+                    return_value=PromptManager(root / "presets"),
+                ),
+                patch(
+                    "script.translate_main.LocalLLM.generate",
+                    side_effect=generate_translation,
+                ) as generate,
+            ):
+                run_interactive_translation(
+                    input_func=input_func,
+                    output_func=lambda _message: None,
+                )
+
+            self.assertEqual(len(prompts), 4)
+            self.assertFalse(any("계속하려면" in prompt for prompt in prompts))
+            self.assertEqual(generate.call_count, 6)
+            self.assertTrue((output_dir / "001.csv").exists())
+            self.assertTrue((output_dir / "002.json").exists())
+            self.assertTrue((output_dir / "003.txt").exists())
+
     def test_custom_prompt_and_languages_are_added_to_every_chunk(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -151,6 +231,16 @@ class TranslationFlowTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 0)
         self.assertIn("프로그램을 종료합니다.", outputs)
+
+    def test_main_converts_keyboard_interrupt_to_clean_exit(self) -> None:
+        with (
+            patch("script.translate_main.run_menu", side_effect=KeyboardInterrupt),
+            patch("builtins.print") as print_mock,
+        ):
+            exit_code = main()
+
+        self.assertEqual(exit_code, 130)
+        print_mock.assert_called_once_with("\n프로그램을 종료합니다.")
 
 
 if __name__ == "__main__":

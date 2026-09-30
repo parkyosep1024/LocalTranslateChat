@@ -2,6 +2,7 @@
 
 import json
 import socket
+import time
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
@@ -13,13 +14,18 @@ from script.utils.exceptions import APIRequestError, InvalidResponseError
 
 
 class GeminiClient:
+    RETRYABLE_HTTP_STATUSES = frozenset({429, 500, 502, 503, 504})
+    MAX_ATTEMPTS = 3
+
     def __init__(
         self,
         settings: Settings,
         opener: Callable[..., Any] = urlopen,
+        sleep_func: Callable[[float], None] = time.sleep,
     ) -> None:
         self.settings = settings
         self._opener = opener
+        self._sleep = sleep_func
 
     def create_chat_completion(self, messages: list[ChatMessage]) -> str:
         self.settings.validate()
@@ -42,27 +48,52 @@ class GeminiClient:
             method="POST",
         )
 
-        try:
-            with self._opener(request, timeout=self.settings.timeout) as response:
-                response_data = json.loads(response.read().decode("utf-8"))
-        except HTTPError as error:
-            detail = self._read_error_detail(error)
-            message = f"Gemini API 요청이 실패했습니다 (HTTP {error.code})"
-            if detail:
-                message += f": {detail}"
-            raise APIRequestError(message) from error
-        except (URLError, TimeoutError, socket.timeout) as error:
-            raise APIRequestError(f"Gemini API에 연결할 수 없습니다: {error}") from error
-        except (UnicodeDecodeError, json.JSONDecodeError) as error:
-            raise InvalidResponseError(
-                "Gemini API가 올바른 JSON 응답을 보내지 않았습니다."
-            ) from error
-        except OSError as error:
-            raise APIRequestError(
-                f"Gemini API 통신 중 오류가 발생했습니다: {error}"
-            ) from error
+        for attempt in range(self.MAX_ATTEMPTS):
+            try:
+                with self._opener(request, timeout=self.settings.timeout) as response:
+                    response_data = json.loads(response.read().decode("utf-8"))
+                break
+            except HTTPError as error:
+                if (
+                    error.code in self.RETRYABLE_HTTP_STATUSES
+                    and attempt < self.MAX_ATTEMPTS - 1
+                ):
+                    delay = self._retry_delay(error, attempt)
+                    error.close()
+                    self._sleep(delay)
+                    continue
+                detail = self._read_error_detail(error)
+                error.close()
+                message = f"Gemini API 요청이 실패했습니다 (HTTP {error.code})"
+                if detail:
+                    message += f": {detail}"
+                raise APIRequestError(message) from error
+            except (URLError, TimeoutError, socket.timeout) as error:
+                raise APIRequestError(
+                    f"Gemini API에 연결할 수 없습니다: {error}"
+                ) from error
+            except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise InvalidResponseError(
+                    "Gemini API가 올바른 JSON 응답을 보내지 않았습니다."
+                ) from error
+            except OSError as error:
+                raise APIRequestError(
+                    f"Gemini API 통신 중 오류가 발생했습니다: {error}"
+                ) from error
 
         return self._extract_answer(response_data)
+
+    @staticmethod
+    def _retry_delay(error: HTTPError, attempt: int) -> float:
+        retry_after = error.headers.get("Retry-After") if error.headers else None
+        if retry_after is not None:
+            try:
+                delay = float(retry_after)
+                if delay >= 0:
+                    return delay
+            except ValueError:
+                pass
+        return float(2**attempt)
 
     @staticmethod
     def _build_request_body(messages: list[ChatMessage]) -> dict[str, Any]:
