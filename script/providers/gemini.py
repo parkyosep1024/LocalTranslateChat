@@ -68,7 +68,23 @@ class GeminiClient:
                 if detail:
                     message += f": {detail}"
                 raise APIRequestError(message) from error
-            except (URLError, TimeoutError, socket.timeout) as error:
+            except (TimeoutError, socket.timeout) as error:
+                # 일시적인 read/connect timeout은 기존 retry 정책과 같은
+                # 횟수(최대 3회 시도)/backoff로 제한적으로 재시도합니다.
+                if attempt < self.MAX_ATTEMPTS - 1:
+                    self._sleep(float(2**attempt))
+                    continue
+                raise APIRequestError(
+                    f"Gemini API 응답 시간이 초과되었습니다: {error}"
+                ) from error
+            except URLError as error:
+                # timeout 계열 URLError만 재시도하고, 그 외 연결 오류는 즉시 실패합니다.
+                if (
+                    isinstance(error.reason, (TimeoutError, socket.timeout))
+                    and attempt < self.MAX_ATTEMPTS - 1
+                ):
+                    self._sleep(float(2**attempt))
+                    continue
                 raise APIRequestError(
                     f"Gemini API에 연결할 수 없습니다: {error}"
                 ) from error

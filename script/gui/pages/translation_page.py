@@ -6,12 +6,14 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
+    QDialog,
     QFileDialog,
     QFrame,
     QHBoxLayout,
     QLabel,
     QProgressBar,
     QPushButton,
+    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -65,6 +67,30 @@ class FileRow(QFrame):
         layout.addWidget(close_btn)
 
 
+class PromptViewDialog(QDialog):
+    """Prompt 내용을 읽기 편하게 보여주는 readonly 다이얼로그입니다."""
+
+    def __init__(self, title: str, subtitle: str, body: str, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Prompt 내용 확인")
+        self.resize(560, 480)
+        layout = QVBoxLayout(self)
+        name_label = QLabel(title)
+        name_label.setStyleSheet("font-size: 15px; font-weight: 800;")
+        sub_label = QLabel(subtitle)
+        sub_label.setObjectName("Muted")
+        body_view = QTextEdit()
+        body_view.setReadOnly(True)
+        body_view.setPlainText(body)
+        close_button = QPushButton("닫기")
+        close_button.setObjectName("SecondaryButton")
+        close_button.clicked.connect(self.accept)
+        layout.addWidget(name_label)
+        layout.addWidget(sub_label)
+        layout.addWidget(body_view, 1)
+        layout.addWidget(close_button, 0, Qt.AlignRight)
+
+
 class TranslationPage(QWidget):
     """좌측 파일 선택/번역 옵션 + 우측 Prompt 선택/번역 진행 화면입니다."""
 
@@ -72,6 +98,10 @@ class TranslationPage(QWidget):
     stop_requested = Signal()
     open_output_requested = Signal()
     files_changed = Signal(object)  # list[Path]
+    field_changed = Signal()
+    view_prompt_requested = Signal()
+    new_prompt_requested = Signal()
+    refresh_input_requested = Signal()
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -126,6 +156,15 @@ class TranslationPage(QWidget):
         header = section_header("1. 파일 선택", "최대 100MB")
         card.inner.addLayout(header)
         self.file_count_label = header.itemAt(2).widget() if header.count() > 2 else None
+
+        refresh_row = QHBoxLayout()
+        refresh_row.setContentsMargins(0, 0, 0, 0)
+        refresh_row.addStretch(1)
+        self.btn_refresh_input = QPushButton("↻ input 폴더 새로고침")
+        self.btn_refresh_input.setObjectName("SecondaryButton")
+        self.btn_refresh_input.clicked.connect(self.refresh_input_requested.emit)
+        refresh_row.addWidget(self.btn_refresh_input)
+        card.inner.addLayout(refresh_row)
 
         drop = QFrame()
         drop.setObjectName("DropArea")
@@ -190,6 +229,10 @@ class TranslationPage(QWidget):
         ai_row.addWidget(muted_label("선택 항목은 수정할 수 있습니다", "TinyMuted"))
         card.inner.addLayout(ai_row)
 
+        self.analysis_label = QLabel("")
+        self.analysis_label.setObjectName("TinyMuted")
+        card.inner.addWidget(self.analysis_label)
+
         self.fields_box = QVBoxLayout()
         self.fields_box.setSpacing(6)
         card.inner.addLayout(self.fields_box)
@@ -221,8 +264,10 @@ class TranslationPage(QWidget):
         btn_row = QHBoxLayout()
         self.btn_view_prompt = QPushButton("👁  Prompt 내용 확인")
         self.btn_view_prompt.setObjectName("SecondaryButton")
+        self.btn_view_prompt.clicked.connect(self.view_prompt_requested.emit)
         self.btn_new_prompt = QPushButton("✦  AI로 새 Prompt 생성")
         self.btn_new_prompt.setObjectName("SecondaryButton")
+        self.btn_new_prompt.clicked.connect(self.new_prompt_requested.emit)
         btn_row.addWidget(self.btn_view_prompt, 1)
         btn_row.addWidget(self.btn_new_prompt, 1)
         card.inner.addLayout(btn_row)
@@ -374,6 +419,7 @@ class TranslationPage(QWidget):
             check = QCheckBox(name)
             check.setChecked(name in chosen)
             check.setStyleSheet("font-weight: 700;")
+            check.toggled.connect(lambda _checked=False: self.field_changed.emit())
             sample_label = QLabel(sample)
             sample_label.setObjectName("TinyMuted")
             row.addWidget(check)
@@ -414,6 +460,19 @@ class TranslationPage(QWidget):
     def set_recommendation(self, title: str, detail: str) -> None:
         self.recommend_title.setText(title)
         self.recommend_sub.setText(detail)
+
+    def set_analysis_status(self, text: str) -> None:
+        """"AI 분석 중..." 같은 Schema 분석 실제 상태를 표시합니다."""
+        self.analysis_label.setText(text)
+
+    def set_generating_prompt(self, busy: bool) -> None:
+        """AI Prompt 생성 중에는 버튼을 잠시 비활성화합니다."""
+        self.btn_new_prompt.setEnabled(not busy)
+        self.btn_new_prompt.setText("✦  Prompt 생성 중..." if busy else "✦  AI로 새 Prompt 생성")
+
+    def show_prompt_dialog(self, title: str, subtitle: str, body: str) -> None:
+        """현재 선택을 바꾸지 않고 Prompt 내용을 readonly로 보여줍니다."""
+        PromptViewDialog(title, subtitle, body, self).exec()
 
     # ---------- 상태 메서드 ----------
     def set_progress(self, percent: int, status: str | None = None) -> None:

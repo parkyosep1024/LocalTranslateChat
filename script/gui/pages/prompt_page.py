@@ -22,6 +22,10 @@ from script.translation.prompt_manager import PromptManager, PromptPreset
 from script.utils.exceptions import ChatbotError
 
 
+#: Prompt Preset에서 사용하는 고정 언어 목록입니다. 자동 감지는 포함하지 않습니다.
+PRESET_LANGUAGES = ("Korean", "Japanese", "English", "Chinese")
+
+
 class PromptListCard(QFrame):
     """저장된 Prompt 1행 카드입니다."""
 
@@ -206,8 +210,14 @@ class PromptPage(QWidget):
         card.inner.addLayout(top)
 
         form = QHBoxLayout()
-        self.source_combo = self._labeled_combo(form, "원본 언어", [])
-        self.target_combo = self._labeled_combo(form, "목표 언어", [])
+        # Prompt Preset 언어는 고정 dropdown입니다. 자동 감지는 넣지 않습니다.
+        # legacy/custom 값은 _set_combo_text()가 안전하게 추가 표시합니다.
+        self.source_combo = self._labeled_combo(
+            form, "원본 언어", list(PRESET_LANGUAGES)
+        )
+        self.target_combo = self._labeled_combo(
+            form, "목표 언어", list(PRESET_LANGUAGES)
+        )
         self.doc_edit = self._labeled_line_edit(form, "문서 유형")
         card.inner.addLayout(form)
 
@@ -389,8 +399,8 @@ class PromptPage(QWidget):
         self.is_new = True
         self.title_label.setText("새 Prompt")
         self.subtitle_label.setText("-")
-        self.source_combo.setCurrentText("")
-        self.target_combo.setCurrentText("")
+        self.source_combo.setCurrentText("Japanese")
+        self.target_combo.setCurrentText("Korean")
         self.doc_edit.clear()
         self.editor.clear()
         self.meta_usage.setText("-")

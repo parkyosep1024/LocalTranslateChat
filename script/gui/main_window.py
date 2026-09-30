@@ -1,27 +1,53 @@
 """QMainWindow + Sidebar + QStackedWidget 공통 셸입니다. 실제 backend에 연결됩니다."""
 
 from pathlib import Path
+import time
 
 from PySide6.QtCore import QObject, QThread, QUrl
 from PySide6.QtGui import QDesktopServices
-from PySide6.QtWidgets import QHBoxLayout, QMainWindow, QStackedWidget, QWidget
+from PySide6.QtWidgets import (
+    QDialog,
+    QHBoxLayout,
+    QInputDialog,
+    QLabel,
+    QLineEdit,
+    QMainWindow,
+    QPushButton,
+    QStackedWidget,
+    QTextEdit,
+    QVBoxLayout,
+    QWidget,
+)
 
 from script.chat.chat_engine import ChatEngine
 from script.config.settings import Settings
-from script.config.translation_settings import TranslationSettings
+from script.config.translation_settings import INPUT_DIR, TranslationSettings
 from script.gui.pages.chat_page import ChatPage
 from script.gui.pages.prompt_page import PromptPage
 from script.gui.pages.translation_page import TranslationPage
 from script.gui.widgets.sidebar import Sidebar
-from script.gui.workers import ChatWorker, OllamaStatusWorker, TranslationWorker
+from script.gui.workers import (
+    ChatWorker,
+    OllamaStatusWorker,
+    PromptDraftWorker,
+    SchemaAnalysisWorker,
+    TranslationWorker,
+)
 from script.providers.gemini import GeminiClient
 from script.providers.local_llm import LocalLLM
 from script.translation.file_loader import FileLoader
 from script.translation.file_writer import FileWriter
 from script.translation.formats import create_handler
 from script.translation.language_detector import LanguageDetector
+from script.translation.prompt_builder import GeminiPromptAI, PromptBuilder
 from script.translation.prompt_manager import PromptManager, PromptPreset
-from script.translation.translator import Translator
+from script.translation.schema_analyzer import (
+    GeminiSchemaAI,
+    SchemaAnalyzer,
+    SchemaCache,
+)
+from script.translation.translator import BASIC_TRANSLATION_PROMPT, Translator
+from script.utils.exceptions import ChatbotError
 
 
 def _display_to_language(name: str) -> str:
@@ -119,32 +145,48 @@ def resolve_fields_for_handler(
     return [name for name in available if name in chosen]
 
 
-def find_unmatched_structured_files(
-    file_paths: list[Path], selected_fields: list[str]
+def validate_per_file_selections(
+    file_paths: list[Path], selections: dict[Path, list[str]]
 ) -> list[Path]:
-    """현재 선택 field와 겹치는 번역 대상이 없는 CSV/JSON을 반환합니다.
+    """번역 대상이 비어 있는 CSV/JSON 파일을 반환합니다.
 
     파일마다 schema가 다를 수 있으므로(예: a.csv의 id/text와
-    b.json의 speaker/dialogue) 첫 파일 기준으로 전체를 가정하지 않고
-    번역 시작 전에 모든 구조화 파일을 검증합니다.
+    b.json의 speaker/dialogue) 파일별 선택값을 검사합니다.
     전체 fallback이나 잘못된 field 자동 번역은 하지 않습니다.
-    향후 파일별 field 선택(Schema Analyzer 연동)으로 확장하기 위한 검사 지점입니다.
+    TXT는 검사 대상이 아닙니다.
     """
-    selected = set(selected_fields or [])
-    offenders: list[Path] = []
+    missing: list[Path] = []
     for path in file_paths:
         if path.suffix.lower() not in {".csv", ".json"}:
             continue
-        try:
-            handler = create_handler(path)
-            handler.load(path)
-            available = handler.available_fields()
-        except Exception:
-            # 읽을 수 없는 파일은 시작 후 per-file 실패로 처리합니다.
-            continue
-        if not any(name in selected for name in available):
-            offenders.append(path)
-    return offenders
+        if not selections.get(path):
+            missing.append(path)
+    return missing
+
+
+def resolve_prompt_view(
+    index: int,
+    presets: list[PromptPreset],
+    target_language: str = "Korean",
+) -> tuple[str, str, str]:
+    """Prompt 내용 확인 다이얼로그용 (제목, 부제, 본문)을 반환합니다.
+
+    index 0(기본 Prompt)이면 BASIC_TRANSLATION_PROMPT를,
+    그 외에는 선택한 Preset의 실제 prompt를 보여줍니다.
+    선택 상태는 바꾸지 않습니다.
+    """
+    text, name = resolve_prompt_selection(index, presets)
+    if text is None:
+        target = _display_to_language(target_language)
+        body = BASIC_TRANSLATION_PROMPT.format(target_language=target).strip()
+        return ("기본 Prompt", f"Translator 기본 번역 규칙 · 목표 언어 {target}", body)
+    preset = presets[index - 1] if 0 < index <= len(presets) else None
+    if preset is None:
+        return ("기본 Prompt", "Translator 기본 번역 규칙", name)
+    subtitle = (
+        f"{preset.source_language} → {preset.target_language} / {preset.document_type}"
+    )
+    return (preset.name, subtitle, preset.prompt)
 
 
 class MainWindow(QMainWindow):
@@ -170,9 +212,18 @@ class MainWindow(QMainWindow):
         self._status_thread: QThread | None = None
         self._translation_thread: QThread | None = None
         self._translation_worker: TranslationWorker | None = None
+        self._prompt_thread: QThread | None = None
+        self._prompt_worker: PromptDraftWorker | None = None
 
         self._ollama_connected: bool | None = None
         self._ollama_model_found: bool | None = None
+
+        # CSV/JSON 파일별 번역 대상 선택값입니다. TXT는 영향을 받지 않습니다.
+        self.file_field_selections: dict[Path, list[str]] = {}
+        self._file_field_info: dict[Path, tuple[list[str], dict]] = {}
+        self._displayed_schema_file: Path | None = None
+        self._schema_cache = SchemaCache()
+        self._pending_draft: dict | None = None
 
         root = QWidget()
         root.setObjectName("AppRoot")
@@ -210,7 +261,13 @@ class MainWindow(QMainWindow):
         self.translation_page.stop_requested.connect(self._on_translation_stop)
         self.translation_page.open_output_requested.connect(self._on_open_output)
         self.translation_page.files_changed.connect(self._on_files_changed)
+        self.translation_page.field_changed.connect(self._on_field_toggled)
+        self.translation_page.view_prompt_requested.connect(self._on_view_prompt)
+        self.translation_page.new_prompt_requested.connect(self._on_new_prompt)
+        self.translation_page.refresh_input_requested.connect(self._load_input_files)
         self._refresh_translation_prompts()
+        # 기존 setting/input 폴더의 파일을 자동 로드합니다.
+        self._load_input_files()
 
         # Ollama 상태 백그라운드 확인 (GUI 시작을 막지 않음)
         self._check_ollama_status()
@@ -239,14 +296,29 @@ class MainWindow(QMainWindow):
             pass
 
     def closeEvent(self, event) -> None:
-        """앱 종료 시 running thread 때문에 crash하지 않도록 정리합니다."""
+        """앱 종료 시 running thread 때문에 crash하지 않도록 정리합니다.
+
+        종료가 무한 대기하지 않도록 전체 5초 deadline 안에서 정리합니다.
+        TranslationWorker에는 먼저 중지를 요청하고,
+        status/chat worker는 안전하게 종료를 기다립니다.
+        """
         try:
             if self._translation_worker is not None:
                 self._translation_worker.request_stop()
+            deadline = time.monotonic() + 5.0
             for thread in list(self._threads):
-                thread.quit()
+                try:
+                    thread.quit()
+                except Exception:
+                    pass
             for thread in list(self._threads):
-                thread.wait(2000)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                try:
+                    thread.wait(max(0, int(remaining * 1000)))
+                except Exception:
+                    pass
         except Exception:
             pass
         super().closeEvent(event)
@@ -394,31 +466,191 @@ class MainWindow(QMainWindow):
         index = self.translation_page.prompt_combo.currentIndex()
         return resolve_prompt_selection(index, self._prompt_presets)
 
-    # ---------- 번역 실행 ----------
+    # ---------- setting/input 자동 로드 ----------
+    def _input_loader(self) -> FileLoader:
+        input_dir = (
+            self.translation_settings.input_dir
+            if self.translation_settings is not None
+            else INPUT_DIR
+        )
+        return FileLoader(input_dir)
+
+    def _load_input_files(self, loader: FileLoader | None = None) -> int:
+        """setting/input의 지원 파일을 목록에 자동 추가합니다.
+
+        새 파일만 추가하고 외부에서 추가한 파일은 삭제하지 않습니다.
+        폴더가 없어도 crash하지 않고 0을 반환합니다.
+        """
+        try:
+            files = (loader or self._input_loader()).list_supported_files()
+        except Exception:
+            return 0
+        added = 0
+        for path in files:
+            if self.translation_page.add_file_path(path):
+                added += 1
+        return added
+
+    # ---------- 파일별 field 선택 + Schema 분석 ----------
+    def _structured_files(self, file_paths: list[Path]) -> list[Path]:
+        return [
+            path
+            for path in file_paths
+            if isinstance(path, Path) and path.suffix.lower() in {".csv", ".json"}
+        ]
+
     def _on_files_changed(self, paths: object) -> None:
         file_paths = list(paths) if isinstance(paths, list) else []
-        self.translation_page.clear_fields()
-        for path in file_paths:
-            if isinstance(path, Path) and path.suffix.lower() in {".csv", ".json"}:
-                fields = self._inspect_fields(path)
-                if fields:
-                    self.translation_page.set_fields(fields, [name for name, _ in fields])
-                break
+        # 제거된 파일의 선택값을 정리합니다.
+        current = set(file_paths)
+        for old in list(self.file_field_selections):
+            if old not in current:
+                del self.file_field_selections[old]
+        for old in list(self._file_field_info):
+            if old not in current:
+                del self._file_field_info[old]
+        structured = self._structured_files(file_paths)
+        if self._displayed_schema_file not in structured:
+            self._displayed_schema_file = structured[0] if structured else None
+        if self._displayed_schema_file is None:
+            self.translation_page.clear_fields()
+            self.translation_page.set_analysis_status("")
+            return
+        for path in structured:
+            if path not in self.file_field_selections:
+                self._analyze_file_fields(path)
+        self._show_displayed_fields()
 
-    def _inspect_fields(self, path: Path) -> list[tuple[str, str]]:
+    def _on_field_toggled(self) -> None:
+        """checkbox 변경을 현재 표시 파일의 선택값에 저장합니다."""
+        if self._displayed_schema_file is not None:
+            self.file_field_selections[self._displayed_schema_file] = (
+                self.translation_page.selected_field_names()
+            )
+
+    def _show_displayed_fields(self) -> None:
+        """현재 표시 대상 파일의 field를 checkbox에 보여줍니다."""
+        path = self._displayed_schema_file
+        info = self._file_field_info.get(path) if path is not None else None
+        if path is None or info is None:
+            self.translation_page.clear_fields()
+            return
+        available, samples = info
+        rows = [
+            (name, " · ".join(samples.get(name, [])[:2]) or "-")
+            for name in available
+        ]
+        selected = self.file_field_selections.get(path, list(available))
+        self.translation_page.set_fields(rows, selected)
+
+    def _create_schema_analyzer(self) -> SchemaAnalyzer | None:
+        """Gemini 설정이 있을 때만 SchemaAnalyzer를 만듭니다."""
+        try:
+            gemini_settings = Settings.from_env()
+            gemini_settings.validate()
+            return SchemaAnalyzer(GeminiSchemaAI(GeminiClient(gemini_settings)))
+        except Exception:
+            return None
+
+    def _analyze_file_fields(self, path: Path) -> None:
+        """한 구조화 파일의 번역 대상을 결정합니다.
+
+        순서: SchemaCache → Gemini 백그라운드 분석 → (설정 없음) 수동 전체 선택.
+        분석 실패 시 전체 fallback 없이 미선택 상태로 두고 사용자가 고릅니다.
+        """
         try:
             handler = create_handler(path)
             handler.load(path)
             available = handler.available_fields()
             samples = handler.sample_fields()
-            result = []
-            for name in available:
-                values = samples.get(name, [])
-                result.append((name, " · ".join(values[:2]) if values else "-"))
-            return result
         except Exception:
-            return []
+            return
+        if not available:
+            return
+        kind = path.suffix.lower().lstrip(".")
+        self._file_field_info[path] = (available, samples)
+        try:
+            cached = self._schema_cache.get(kind, available)
+        except Exception:
+            cached = None
+        if cached is not None:
+            self.file_field_selections[path] = list(cached.translate_fields)
+            if path == self._displayed_schema_file:
+                self._show_displayed_fields()
+                self.translation_page.set_analysis_status(f"{path.name}: 저장된 분석 적용")
+            return
+        analyzer = self._create_schema_analyzer()
+        if analyzer is None:
+            # 오프라인 수동 모드: 기존 동작(전체 선택)을 유지합니다.
+            self.file_field_selections[path] = list(available)
+            if path == self._displayed_schema_file:
+                self._show_displayed_fields()
+            return
+        self.translation_page.set_analysis_status(f"{path.name}: AI 분석 중...")
+        worker = SchemaAnalysisWorker(analyzer, str(path), kind, available, samples)
+        thread = QThread(self)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(self._on_schema_finished)
+        worker.failed.connect(self._on_schema_failed)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        self._launch(thread, worker)
+        thread.start()
 
+    def _on_schema_finished(self, key: object, analysis: object) -> None:
+        try:
+            path = Path(str(key))
+        except Exception:
+            return
+        if path not in self.translation_page.selected_paths():
+            return
+        translate_fields = list(getattr(analysis, "translate_fields", []))
+        self.file_field_selections[path] = translate_fields
+        try:
+            info = self._file_field_info.get(path)
+            if info is not None:
+                kind = path.suffix.lower().lstrip(".")
+                self._schema_cache.put(kind, info[0], analysis)
+        except Exception:
+            pass
+        if path == self._displayed_schema_file:
+            self._show_displayed_fields()
+            self.translation_page.set_analysis_status(
+                f"{path.name}: AI 추천 적용됨 (수정 가능)"
+            )
+
+    def _on_schema_failed(self, key: object, error: str) -> None:
+        try:
+            path = Path(str(key))
+        except Exception:
+            return
+        if path not in self.translation_page.selected_paths():
+            return
+        # 실패 fallback: 전체를 무조건 선택하지 않고 미선택 상태로 둡니다.
+        self.file_field_selections[path] = []
+        if path == self._displayed_schema_file:
+            self._show_displayed_fields()
+            self.translation_page.set_analysis_status(
+                f"{path.name}: AI 분석 실패, 직접 선택해주세요 ({error})"
+            )
+
+    def _sync_displayed_selection(self) -> None:
+        if self._displayed_schema_file is not None:
+            self.file_field_selections[self._displayed_schema_file] = (
+                self.translation_page.selected_field_names()
+            )
+
+    def _all_selected_fields(self) -> list[str]:
+        """언어 감지 sample용으로 모든 파일의 선택값을 합칩니다."""
+        merged: list[str] = []
+        for names in self.file_field_selections.values():
+            for name in names:
+                if name not in merged:
+                    merged.append(name)
+        return merged
+
+    # ---------- 번역 실행 ----------
     def _on_translation_start(self) -> None:
         if self.translation_settings is None:
             self.translation_page.set_status("OLLAMA_MODEL 등 번역 설정을 .env에 입력해주세요.")
@@ -443,24 +675,15 @@ class MainWindow(QMainWindow):
                 f"{self.translation_settings.model}"
             )
             return
-        # CSV/JSON인데 field를 0개 선택했으면 전체 fallback 없이 시작을 막습니다.
-        has_structured = any(
-            path.suffix.lower() in {".csv", ".json"} for path in file_paths
-        )
-        selected_fields = self.translation_page.selected_field_names()
-        if has_structured and not selected_fields:
+        # 파일별 선택값으로 검증합니다. 비어 있는 파일이 있으면 시작을 막습니다.
+        # 전체 fallback이나 잘못된 field 자동 번역을 하지 않습니다.
+        self._sync_displayed_selection()
+        missing = validate_per_file_selections(file_paths, self.file_field_selections)
+        if missing:
+            names = "\n".join(f"· {path.name}" for path in missing)
             self.translation_page.set_status(
-                "CSV/JSON 번역 대상 field를 1개 이상 선택해주세요. "
-                "선택하지 않은 컬럼/Key는 번역하지 않습니다."
-            )
-            return
-        # 서로 다른 schema의 파일이 섞여 있으면 조용히 오번역하지 않고 시작을 막습니다.
-        unmatched = find_unmatched_structured_files(file_paths, selected_fields)
-        if unmatched:
-            names = "\n".join(f"· {path.name}" for path in unmatched)
-            self.translation_page.set_status(
-                "다음 파일에 선택한 field와 일치하는 번역 대상이 없습니다:\n"
-                f"{names}\n번역을 시작하지 않았습니다."
+                "다음 파일의 번역 대상 field를 1개 이상 선택해주세요:\n"
+                f"{names}\n선택하지 않은 컬럼/Key는 번역하지 않습니다."
             )
             return
         if self._translation_thread is not None and self._translation_thread.isRunning():
@@ -471,7 +694,7 @@ class MainWindow(QMainWindow):
         source, notice = detect_source_language(
             self.translation_page.source_combo.currentText(),
             file_paths,
-            selected_fields,
+            self._all_selected_fields(),
         )
         if notice:
             self.translation_page.set_status(notice)
@@ -520,20 +743,21 @@ class MainWindow(QMainWindow):
         thread.start()
 
     def _build_handlers(self, file_paths: list[Path], chunk_max_chars: int) -> dict:
-        """CSV/JSON은 체크된 field만, TXT는 기본 핸들러로 번역합니다.
+        """CSV/JSON은 파일별 선택 field만, TXT는 기본 핸들러로 번역합니다.
 
         선택이 0개면 전체 fallback을 하지 않고 해당 파일을 건너뜁니다.
         (시작 전에 막히므로 여기는 방어용입니다.)
         """
         handlers: dict = {}
-        selected = self.translation_page.selected_field_names()
         for path in file_paths:
             try:
                 handler = create_handler(path, chunk_max_chars)
                 handler.load(path)
                 available = handler.available_fields()
                 if path.suffix.lower() in {".csv", ".json"} and available:
-                    use = resolve_fields_for_handler(available, selected)
+                    use = resolve_fields_for_handler(
+                        available, self.file_field_selections.get(path, [])
+                    )
                     if not use:
                         continue
                     handler.select_fields(use)
@@ -541,6 +765,142 @@ class MainWindow(QMainWindow):
             except Exception:
                 continue
         return handlers
+
+    # ---------- Prompt 내용 확인 / AI 생성 ----------
+    def _on_view_prompt(self) -> None:
+        index = self.translation_page.prompt_combo.currentIndex()
+        title, subtitle, body = resolve_prompt_view(
+            index,
+            self._prompt_presets,
+            self.translation_page.target_combo.currentText(),
+        )
+        self.translation_page.show_prompt_dialog(title, subtitle, body)
+
+    def _on_new_prompt(self) -> None:
+        if self._prompt_thread is not None and self._prompt_thread.isRunning():
+            return
+        file_paths = self.translation_page.selected_paths()
+        if not file_paths:
+            self.translation_page.set_status("Prompt 생성용 파일을 먼저 추가해주세요.")
+            return
+        target = _display_to_language(self.translation_page.target_combo.currentText())
+        self._sync_displayed_selection()
+        source, notice = detect_source_language(
+            self.translation_page.source_combo.currentText(),
+            file_paths,
+            self._all_selected_fields(),
+        )
+        if notice:
+            self.translation_page.set_status(notice)
+        document_type, ok = QInputDialog.getText(
+            self, "문서 유형", "문서 유형 (예: game_dialogue):", text="game_dialogue"
+        )
+        if not ok or not document_type.strip():
+            return
+        document_type = document_type.strip()
+        try:
+            gemini_settings = Settings.from_env()
+            gemini_settings.validate()
+        except Exception:
+            self.translation_page.set_status(
+                "Gemini API 설정이 없습니다. Prompt 설정 화면에서 직접 만들 수 있습니다."
+            )
+            return
+        sample = collect_detection_sample(file_paths, self._all_selected_fields())
+        if not sample.strip():
+            self.translation_page.set_status("Prompt 생성용 샘플이 없습니다.")
+            return
+        builder = PromptBuilder(GeminiPromptAI(GeminiClient(gemini_settings)))
+        self._pending_draft = {
+            "source": source,
+            "target": target,
+            "document_type": document_type,
+        }
+        worker = PromptDraftWorker(
+            builder, file_paths, source, target, document_type, sample
+        )
+        thread = QThread(self)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(self._on_prompt_draft)
+        worker.failed.connect(self._on_prompt_draft_failed)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        self._launch(
+            thread, worker,
+            {"_prompt_thread": thread, "_prompt_worker": worker},
+        )
+        self.translation_page.set_generating_prompt(True)
+        self._prompt_thread = thread
+        self._prompt_worker = worker
+        thread.start()
+
+    def _on_prompt_draft(self, draft: str) -> None:
+        self.translation_page.set_generating_prompt(False)
+        self._prompt_worker = None
+        pending = self._pending_draft or {}
+        dialog = QDialog(self)
+        dialog.setWindowTitle("AI Prompt 초안")
+        dialog.resize(560, 480)
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(QLabel("AI가 생성한 Prompt 초안입니다. 수정 후 저장하세요."))
+        name_edit = QLineEdit()
+        name_edit.setPlaceholderText("저장할 Preset 이름")
+        draft_edit = QTextEdit()
+        draft_edit.setPlainText(draft)
+        buttons = QHBoxLayout()
+        save_button = QPushButton("저장")
+        save_button.setObjectName("PrimaryButton")
+        cancel_button = QPushButton("취소")
+        cancel_button.setObjectName("SecondaryButton")
+        buttons.addStretch(1)
+        buttons.addWidget(cancel_button)
+        buttons.addWidget(save_button)
+        layout.addWidget(QLabel("Preset 이름"))
+        layout.addWidget(name_edit)
+        layout.addWidget(draft_edit, 1)
+        layout.addLayout(buttons)
+        saved: list[bool] = []
+
+        def save() -> None:
+            name = name_edit.text().strip()
+            body = draft_edit.toPlainText().strip()
+            if not name or not body:
+                self.translation_page.set_status("Preset 이름과 내용을 입력하세요.")
+                return
+            try:
+                preset = self.prompt_manager.create_preset(
+                    name,
+                    str(pending.get("source", "Unknown")),
+                    str(pending.get("target", "Korean")),
+                    str(pending.get("document_type", "general")),
+                    body,
+                    "AI",
+                )
+                self.prompt_manager.save(preset, overwrite=False)
+            except ChatbotError as error:
+                self.translation_page.set_status(f"Preset 저장 실패: {error}")
+                return
+            saved.append(True)
+            dialog.accept()
+
+        save_button.clicked.connect(save)
+        cancel_button.clicked.connect(dialog.reject)
+        dialog.exec()
+        # 저장 후에는 번역을 자동 시작하지 않고 combo만 refresh합니다.
+        if saved:
+            self._refresh_translation_prompts()
+            self.translation_page.set_status("새 Prompt를 저장했습니다.")
+        self._pending_draft = None
+
+    def _on_prompt_draft_failed(self, error: str) -> None:
+        self.translation_page.set_generating_prompt(False)
+        self._prompt_worker = None
+        self._pending_draft = None
+        self.translation_page.set_status(
+            f"AI Prompt 생성 실패: {error} "
+            "Prompt 설정 화면에서 직접 만들 수 있습니다."
+        )
 
     def _on_translation_finished(self, summary: object) -> None:
         self.translation_page.set_translation_state("done")

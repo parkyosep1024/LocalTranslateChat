@@ -101,6 +101,71 @@ class OllamaStatusWorker(QObject):
         self.finished.emit(fetch_ollama_status(self._base_url, self._model, self._timeout))
 
 
+class SchemaAnalysisWorker(QObject):
+    """Gemini SchemaAnalyzer.analyze 비동기 실행용 Worker입니다.
+
+    finished는 (key, SchemaAnalysis), failed는 (key, 오류문구)를 전달합니다.
+    key는 호출자가 파일 식별용으로 정합니다(보통 str(path)).
+    """
+
+    finished = Signal(object, object)
+    failed = Signal(object, object)
+
+    def __init__(self, analyzer, key: object, kind: str, fields: list, samples: dict) -> None:
+        super().__init__()
+        self._analyzer = analyzer
+        self._key = key
+        self._kind = kind
+        self._fields = list(fields)
+        self._samples = dict(samples)
+
+    def run(self) -> None:
+        try:
+            analysis = self._analyzer.analyze(self._kind, self._fields, self._samples)
+        except Exception as error:  # GUI 프로세스를 죽이지 않고 signal로 전달합니다.
+            self.failed.emit(self._key, str(error))
+        else:
+            self.finished.emit(self._key, analysis)
+
+
+class PromptDraftWorker(QObject):
+    """PromptBuilder.create_draft 비동기 실행용 Worker입니다."""
+
+    finished = Signal(str)
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        builder,
+        files: list,
+        source_language: str,
+        target_language: str,
+        document_type: str,
+        sample_text: str | None = None,
+    ) -> None:
+        super().__init__()
+        self._builder = builder
+        self._files = list(files)
+        self._source_language = source_language
+        self._target_language = target_language
+        self._document_type = document_type
+        self._sample_text = sample_text
+
+    def run(self) -> None:
+        try:
+            draft = self._builder.create_draft(
+                self._files,
+                self._source_language,
+                self._target_language,
+                self._document_type,
+                sample_text=self._sample_text,
+            )
+        except Exception as error:  # GUI 프로세스를 죽이지 않고 signal로 전달합니다.
+            self.failed.emit(str(error))
+        else:
+            self.finished.emit(draft)
+
+
 class TranslationWorker(QObject):
     """Translator.translate_all 실행용 Worker입니다."""
 

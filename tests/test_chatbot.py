@@ -278,6 +278,72 @@ class GeminiTests(unittest.TestCase):
         self.assertEqual(calls, 1)
         self.assertEqual(delays, [])
 
+    def test_timeout_then_succeeds_with_limited_retry(self) -> None:
+        events = [
+            TimeoutError("The read operation timed out"),
+            TimeoutError("The read operation timed out"),
+            FakeResponse({"candidates": [{"content": {"parts": [{"text": "ok"}]}}]}),
+        ]
+        delays: list[float] = []
+
+        def opener(*_args, **_kwargs):
+            event = events.pop(0)
+            if isinstance(event, Exception):
+                raise event
+            return event
+
+        client = GeminiClient(
+            Settings(api_key="test-key", model="gemini-test"),
+            opener=opener,
+            sleep_func=delays.append,
+        )
+
+        self.assertEqual(client.create_chat_completion([]), "ok")
+        self.assertEqual(delays, [1.0, 2.0])
+
+    def test_persistent_timeout_raises_after_three_attempts(self) -> None:
+        calls = 0
+        delays: list[float] = []
+
+        def opener(*_args, **_kwargs):
+            nonlocal calls
+            calls += 1
+            raise TimeoutError("The read operation timed out")
+
+        client = GeminiClient(
+            Settings(api_key="test-key", model="gemini-test"),
+            opener=opener,
+            sleep_func=delays.append,
+        )
+
+        with self.assertRaisesRegex(APIRequestError, "응답 시간이 초과"):
+            client.create_chat_completion([])
+
+        self.assertEqual(calls, 3)
+        self.assertEqual(delays, [1.0, 2.0])
+
+    def test_urlerror_caused_by_timeout_retries(self) -> None:
+        events = [
+            URLError(TimeoutError("timed out")),
+            FakeResponse({"candidates": [{"content": {"parts": [{"text": "ok"}]}}]}),
+        ]
+        delays: list[float] = []
+
+        def opener(*_args, **_kwargs):
+            event = events.pop(0)
+            if isinstance(event, Exception):
+                raise event
+            return event
+
+        client = GeminiClient(
+            Settings(api_key="test-key", model="gemini-test"),
+            opener=opener,
+            sleep_func=delays.append,
+        )
+
+        self.assertEqual(client.create_chat_completion([]), "ok")
+        self.assertEqual(delays, [1.0])
+
 
 class CliTests(unittest.TestCase):
     def test_clear_and_exit_commands(self) -> None:
