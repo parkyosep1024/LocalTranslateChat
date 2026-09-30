@@ -1,9 +1,9 @@
 """Ollama TXT/CSV/JSON 번역과 Prompt Preset 작성을 위한 콘솔 진입점입니다."""
 
+import sys
 from collections.abc import Callable
 from pathlib import Path
-import sys
-
+from typing import Protocol, cast
 
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -15,7 +15,7 @@ from script.providers.local_llm import LocalLLM
 from script.translation.file_loader import FileLoader
 from script.translation.file_writer import FileWriter
 from script.translation.formats import FormatHandler, create_handler
-from script.translation.language_detector import LanguageDetector, SUPPORTED_LANGUAGES
+from script.translation.language_detector import SUPPORTED_LANGUAGES, LanguageDetector
 from script.translation.prompt_builder import GeminiPromptAI, PromptBuilder
 from script.translation.prompt_manager import PromptManager, PromptPreset
 from script.translation.prompt_usage import PromptUsageRegistry
@@ -34,9 +34,14 @@ from script.translation.translator import (
 )
 from script.utils.exceptions import ChatbotError, ConfigurationError
 
-
 InputFunction = Callable[[str], str]
 OutputFunction = Callable[[str], None]
+
+
+class _SampledFormatHandler(Protocol):
+    def sample_fields(
+        self, max_samples: int = 5, max_chars: int = 300
+    ) -> dict[str, list[str]]: ...
 
 
 def create_translator(
@@ -108,6 +113,7 @@ def choose_language(
         return None
 
     return SUPPORTED_LANGUAGES[choice]
+
 
 def confirm_source_language(
     detected_language: str,
@@ -422,7 +428,7 @@ def _select_and_confirm_prompt(
 
         valid = {str(index) for index in range(1, len(presets) + 2)} | {"0"}
         choice = _read_choice(valid, input_func, output_func)
-        if choice in {None, "0"}:
+        if choice is None or choice == "0":
             return None
 
         preset: PromptPreset | None = None
@@ -567,11 +573,12 @@ def _prepare_handlers(
                     source = "저장된 Cache"
                 if analysis is None and analyzer_factory is not None:
                     try:
+                        sampled_handler = cast(_SampledFormatHandler, handler)
                         analysis = analyzer_factory().analyze(
-                            kind, fields, handler.sample_fields()
+                            kind, fields, sampled_handler.sample_fields()
                         )
                         source = "Gemini"
-                    except Exception as error:
+                    except Exception as error:  # noqa: BLE001 - provider 실패 시 수동 선택
                         output_func(f"{path.name}: AI 자동 분석을 사용할 수 없습니다 ({error}).")
                 if analysis is None:
                     output_func("기존 수동 선택 방식으로 진행합니다.")
