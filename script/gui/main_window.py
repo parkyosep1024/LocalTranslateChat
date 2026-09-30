@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from PySide6.QtCore import QThread, QUrl
+from PySide6.QtCore import QObject, QThread, QUrl
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import QHBoxLayout, QMainWindow, QStackedWidget, QWidget
 
@@ -19,6 +19,7 @@ from script.providers.local_llm import LocalLLM
 from script.translation.file_loader import FileLoader
 from script.translation.file_writer import FileWriter
 from script.translation.formats import create_handler
+from script.translation.language_detector import LanguageDetector
 from script.translation.prompt_manager import PromptManager, PromptPreset
 from script.translation.translator import Translator
 
@@ -26,6 +27,96 @@ from script.translation.translator import Translator
 def _display_to_language(name: str) -> str:
     mapping = {"한국어": "Korean", "자동 감지": "Unknown"}
     return mapping.get(name, name)
+
+
+def collect_detection_sample(
+    file_paths: list[Path],
+    selected_fields: list[str] | None = None,
+    per_file_chars: int = 3_000,
+    total_chars: int = 12_000,
+) -> str:
+    """원본 언어 감지용 sample을 실제 선택 파일에서 수집합니다.
+
+    TXT는 실제 텍스트를, CSV/JSON은 GUI에서 선택한 field/key의 실제 값만
+    사용합니다. backend를 새로 만들지 않고 기존 handler/FileLoader를 재사용합니다.
+    """
+    parts: list[str] = []
+    remaining = total_chars
+    selected = set(selected_fields or [])
+    for path in file_paths:
+        if remaining <= 0:
+            break
+        suffix = path.suffix.lower()
+        try:
+            if suffix == ".txt":
+                text = FileLoader.read_text(path)[: min(per_file_chars, remaining)]
+            elif suffix in {".csv", ".json"}:
+                handler = create_handler(path)
+                handler.load(path)
+                available = handler.available_fields()
+                use = [name for name in available if name in selected] if selected else available
+                samples = handler.sample_fields()
+                text = "\n".join(
+                    value for name in use for value in samples.get(name, [])
+                )[: min(per_file_chars, remaining)]
+            else:
+                continue
+        except Exception:
+            continue
+        if text.strip():
+            parts.append(text)
+            remaining -= len(text)
+    return "\n".join(parts)
+
+
+def detect_source_language(
+    display_name: str,
+    file_paths: list[Path],
+    selected_fields: list[str] | None = None,
+) -> tuple[str, str | None]:
+    """콤보 표시값에서 Translator용 source_language를 결정합니다.
+
+    "자동 감지"면 기존 LanguageDetector를 실제 sample에 적용하고,
+    직접 선택이면 그대로 사용합니다. 반환: (language, 안내문구|None)
+    """
+    if display_name != "자동 감지":
+        return _display_to_language(display_name), None
+    try:
+        sample = collect_detection_sample(file_paths, selected_fields)
+        detected = LanguageDetector.detect_text(sample) if sample.strip() else "Unknown"
+    except Exception:
+        detected = "Unknown"
+    if detected == "Unknown":
+        return "Unknown", "원본 언어를 감지하지 못해 Unknown으로 진행합니다."
+    return detected, f"원본 언어 감지: {detected}"
+
+
+def resolve_prompt_selection(
+    index: int, presets: list[PromptPreset]
+) -> tuple[str | None, str]:
+    """번역 화면 콤보 index를 Preset에 매핑합니다.
+
+    index 0은 항상 기본 Prompt(None)이며, 그 뒤로 presets가 이어집니다.
+    범위를 벗어난 index도 기본 Prompt로 안전하게 처리합니다.
+    """
+    if index <= 0 or not presets:
+        return None, "기본 Prompt"
+    if index - 1 < len(presets):
+        preset = presets[index - 1]
+        return preset.prompt, preset.name
+    return None, "기본 Prompt"
+
+
+def resolve_fields_for_handler(
+    available: list[str], selected: list[str]
+) -> list[str]:
+    """handler.select_fields()에 넘길 field를 결정합니다.
+
+    선택된 것만 반환하며, 0개 선택 시 전체 fallback을 하지 않습니다.
+    (호출자가 시작 전에 막아야 합니다.)
+    """
+    chosen = set(selected)
+    return [name for name in available if name in chosen]
 
 
 class MainWindow(QMainWindow):
@@ -81,13 +172,39 @@ class MainWindow(QMainWindow):
         self._refresh_translation_prompts()
 
         # Ollama 상태 백그라운드 확인 (GUI 시작을 막지 않음)
+        self._ollama_connected: bool | None = None
+        self._ollama_model_found: bool | None = None
         self._check_ollama_status()
 
+        self._threads: set[QThread] = set()
+        self._workers: set[QObject] = set()
         self._chat_thread: QThread | None = None
         self._chat_worker: ChatWorker | None = None
         self._status_thread: QThread | None = None
         self._translation_thread: QThread | None = None
         self._translation_worker: TranslationWorker | None = None
+
+    def _launch(self, thread: QThread, worker: QObject) -> None:
+        """thread 실행 중 GC 방지 + 종료 후 정리 + 재시작 가능하도록 추적합니다."""
+        self._threads.add(thread)
+        self._workers.add(worker)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(lambda _t=thread: self._threads.discard(_t))
+        thread.finished.connect(lambda _w=worker: self._workers.discard(_w))
+
+    def closeEvent(self, event) -> None:
+        """앱 종료 시 running thread 때문에 crash하지 않도록 정리합니다."""
+        try:
+            if self._translation_worker is not None:
+                self._translation_worker.request_stop()
+            for thread in list(self._threads):
+                thread.quit()
+            for thread in list(self._threads):
+                thread.wait(2000)
+        except Exception:
+            pass
+        super().closeEvent(event)
 
     # ---------- 페이지 ----------
     def set_page(self, index: int) -> None:
@@ -131,6 +248,9 @@ class MainWindow(QMainWindow):
                 "Gemini API 설정이 없습니다. .env의 GEMINI_API_KEY / GEMINI_MODEL을 확인해주세요."
             )
             return
+        if self._chat_thread is not None and self._chat_thread.isRunning():
+            self.chat_page.add_error_message("이전 요청을 처리 중입니다. 잠시 후 다시 시도해주세요.")
+            return
         self.chat_page.set_sending(True)
         thread = QThread(self)
         worker = ChatWorker(self.chat_engine, text)
@@ -140,8 +260,7 @@ class MainWindow(QMainWindow):
         worker.failed.connect(self._on_chat_failed)
         worker.finished.connect(thread.quit)
         worker.failed.connect(thread.quit)
-        thread.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
+        self._launch(thread, worker)
         self._chat_thread = thread
         self._chat_worker = worker
         thread.start()
@@ -169,22 +288,40 @@ class MainWindow(QMainWindow):
             if self.translation_settings is not None
             else "http://localhost:11434"
         )
+        model = (
+            self.translation_settings.model
+            if self.translation_settings is not None
+            else ""
+        )
         thread = QThread(self)
-        worker = OllamaStatusWorker(base_url)
+        worker = OllamaStatusWorker(base_url, model)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.finished.connect(self._on_ollama_status)
         worker.finished.connect(thread.quit)
-        thread.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
+        self._launch(thread, worker)
         self._status_thread = thread
         thread.start()
 
-    def _on_ollama_status(self, connected: bool) -> None:
-        self.sidebar.set_model_status(
-            connected, "● 로컬 모델 연결됨" if connected else "○ 로컬 모델 연결 안 됨"
-        )
-        self.translation_page.set_engine_status(connected)
+    def _on_ollama_status(self, result: object) -> None:
+        """세 상태를 구분합니다: 연결+모델 있음 / 연결+모델 없음 / 연결 실패."""
+        if isinstance(result, dict):
+            connected = bool(result.get("connected", False))
+            model_found = bool(result.get("model_found", False))
+        else:  # 기존 bool 형태 호환
+            connected = bool(result)
+            model_found = bool(result)
+        self._ollama_connected = connected
+        self._ollama_model_found = model_found if connected else False
+        if connected and model_found:
+            self.sidebar.set_model_status(True, "● 로컬 모델 연결됨")
+            self.translation_page.set_engine_status(True)
+        elif connected:
+            self.sidebar.set_model_status(True, "● Ollama 연결됨")
+            self.translation_page.set_engine_status(False, "○ 모델 없음")
+        else:
+            self.sidebar.set_model_status(False, "○ 로컬 모델 연결 안 됨")
+            self.translation_page.set_engine_status(False)
 
     # ---------- Prompt 목록 (번역 화면 콤보) ----------
     def _refresh_translation_prompts(self) -> None:
@@ -192,29 +329,25 @@ class MainWindow(QMainWindow):
             self._prompt_presets = self.prompt_manager.list_presets()
         except Exception:
             self._prompt_presets = []
-        if self._prompt_presets:
-            items = [
+        # set_prompt_items()가 항상 "기본 Prompt"를 index 0에 둡니다.
+        self.translation_page.set_prompt_items(
+            [
                 f"{p.source_language} → {p.target_language} · {p.name}"
                 for p in self._prompt_presets
             ]
-            self.translation_page.set_prompt_items(items)
+        )
+        if self._prompt_presets:
             self.translation_page.set_recommendation(
-                "저장된 Prompt에서 선택", f"총 {len(self._prompt_presets)}개 Preset"
+                "저장된 Prompt에서 선택", f"기본 Prompt + {len(self._prompt_presets)}개 Preset"
             )
         else:
-            self.translation_page.set_prompt_items([])
             self.translation_page.set_recommendation(
                 "저장된 Prompt 없음", "Prompt 설정에서 새로 만드세요."
             )
 
     def _selected_translation_prompt(self) -> tuple[str | None, str]:
-        if not self._prompt_presets:
-            return None, "기본 Prompt"
         index = self.translation_page.prompt_combo.currentIndex()
-        if 0 <= index < len(self._prompt_presets):
-            preset = self._prompt_presets[index]
-            return preset.prompt, preset.name
-        return None, "기본 Prompt"
+        return resolve_prompt_selection(index, self._prompt_presets)
 
     # ---------- 번역 실행 ----------
     def _on_files_changed(self, paths: object) -> None:
@@ -249,12 +382,40 @@ class MainWindow(QMainWindow):
         if not file_paths:
             self.translation_page.set_status("번역할 파일을 먼저 추가해주세요.")
             return
+        if self._ollama_connected is False:
+            self.translation_page.set_status(
+                "Ollama 서버에 연결할 수 없습니다. Ollama가 실행 중인지 확인해주세요."
+            )
+            return
+        if self._ollama_connected and not self._ollama_model_found:
+            self.translation_page.set_status(
+                "설정된 Ollama 모델을 찾을 수 없습니다:\n"
+                f"{self.translation_settings.model}"
+            )
+            return
+        # CSV/JSON인데 field를 0개 선택했으면 전체 fallback 없이 시작을 막습니다.
+        has_structured = any(
+            path.suffix.lower() in {".csv", ".json"} for path in file_paths
+        )
+        selected_fields = self.translation_page.selected_field_names()
+        if has_structured and not selected_fields:
+            self.translation_page.set_status(
+                "CSV/JSON 번역 대상 field를 1개 이상 선택해주세요. "
+                "선택하지 않은 컬럼/Key는 번역하지 않습니다."
+            )
+            return
         if self._translation_thread is not None and self._translation_thread.isRunning():
             return
         self.translation_page.set_translation_state("running")
         self.translation_page.set_progress(0, "번역 준비 중…")
 
-        source = _display_to_language(self.translation_page.source_combo.currentText())
+        source, notice = detect_source_language(
+            self.translation_page.source_combo.currentText(),
+            file_paths,
+            selected_fields,
+        )
+        if notice:
+            self.translation_page.set_status(notice)
         target = _display_to_language(self.translation_page.target_combo.currentText())
         prompt_text, prompt_name = self._selected_translation_prompt()
         settings = self.translation_settings
@@ -291,23 +452,28 @@ class MainWindow(QMainWindow):
         worker.finished.connect(thread.quit)
         worker.failed.connect(thread.quit)
         worker.stopped.connect(thread.quit)
-        thread.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
+        self._launch(thread, worker)
         self._translation_thread = thread
         self._translation_worker = worker
         thread.start()
 
     def _build_handlers(self, file_paths: list[Path], chunk_max_chars: int) -> dict:
-        """CSV/JSON은 체크된 field만, TXT는 기본 핸들러로 번역합니다."""
+        """CSV/JSON은 체크된 field만, TXT는 기본 핸들러로 번역합니다.
+
+        선택이 0개면 전체 fallback을 하지 않고 해당 파일을 건너뜁니다.
+        (시작 전에 막히므로 여기는 방어용입니다.)
+        """
         handlers: dict = {}
-        selected = set(self.translation_page.selected_field_names())
+        selected = self.translation_page.selected_field_names()
         for path in file_paths:
             try:
                 handler = create_handler(path, chunk_max_chars)
                 handler.load(path)
                 available = handler.available_fields()
                 if path.suffix.lower() in {".csv", ".json"} and available:
-                    use = [name for name in available if name in selected] or available
+                    use = resolve_fields_for_handler(available, selected)
+                    if not use:
+                        continue
                     handler.select_fields(use)
                 handlers[path] = handler
             except Exception:

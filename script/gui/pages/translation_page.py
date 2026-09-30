@@ -405,11 +405,11 @@ class TranslationPage(QWidget):
 
     # ---------- Prompt 콤보 (실제 Preset용) ----------
     def set_prompt_items(self, items: list[str]) -> None:
+        """Preset 유무와 무관하게 항상 첫 항목은 '기본 Prompt'입니다."""
         self.prompt_combo.clear()
+        self.prompt_combo.addItem("기본 Prompt")
         if items:
             self.prompt_combo.addItems(items)
-        else:
-            self.prompt_combo.addItem("기본 Prompt")
 
     def set_recommendation(self, title: str, detail: str) -> None:
         self.recommend_title.setText(title)
@@ -437,13 +437,19 @@ class TranslationPage(QWidget):
         self.btn_start.setEnabled(state in {"idle", "stopped", "done"})
         self.btn_stop.setEnabled(state == "running")
 
-    def set_engine_status(self, ready: bool) -> None:
-        """상단 엔진 Badge를 실제 Ollama 상태와 연동합니다."""
-        self.engine_badge.setText("● 엔진 준비됨" if ready else "○ 엔진 확인 필요")
+    def set_engine_status(self, ready: bool, text: str | None = None) -> None:
+        """상단 엔진 Badge를 실제 Ollama 상태와 연동합니다.
+
+        text가 주어지면(예: "○ 모델 없음") 그대로 표시하고,
+        없으면 ready 여부에 따른 기본 문구를 사용합니다.
+        """
+        self.engine_badge.setText(
+            text if text is not None else ("● 엔진 준비됨" if ready else "○ 엔진 확인 필요")
+        )
         self.engine_badge.setObjectName("BadgeGreen" if ready else "BadgeBlue")
         self.engine_badge.style().unpolish(self.engine_badge)
         self.engine_badge.style().polish(self.engine_badge)
 
-    def set_model_status(self, ready: bool) -> None:
+    def set_model_status(self, ready: bool, text: str | None = None) -> None:
         """기존 호환용 별칭입니다. 상단 Badge를 갱신합니다."""
-        self.set_engine_status(ready)
+        self.set_engine_status(ready, text)

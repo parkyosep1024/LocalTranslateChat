@@ -33,28 +33,72 @@ class ChatWorker(QObject):
             self.finished.emit(answer)
 
 
+def ollama_model_found(payload: object, model: str) -> bool:
+    """`/api/tags` 응답에 설정된 모델이 설치되어 있는지 확인합니다.
+
+    태그(`:latest` 등)가 생략된 설정값은 같은 base 이름이면 존재로 인정합니다.
+    태그까지 지정된 경우에는 정확히 일치해야 합니다.
+    """
+    if not isinstance(payload, dict) or not model or not model.strip():
+        return False
+    models = payload.get("models")
+    if not isinstance(models, list):
+        return False
+    want = model.strip()
+    want_base = want.split(":")[0].casefold()
+    want_has_tag = ":" in want
+    for entry in models:
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        if name == want:
+            return True
+        if not want_has_tag and name.split(":")[0].casefold() == want_base:
+            return True
+    return False
+
+
+def fetch_ollama_status(
+    base_url: str,
+    model: str = "",
+    timeout: float = 3.0,
+    opener=None,
+) -> dict:
+    """Ollama 서버 연결과 설정 모델 존재 여부를 함께 확인합니다.
+
+    반환: {"connected": bool, "model_found": bool}
+    어떤 실패에서도 예외를 던지지 않고 dict만 반환합니다.
+    """
+    import json
+    from urllib.request import Request, urlopen
+
+    opener = opener or urlopen
+    try:
+        request = Request(f"{base_url.rstrip('/')}/api/tags", method="GET")
+        with opener(request, timeout=timeout) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except Exception:
+        return {"connected": False, "model_found": False}
+    if not isinstance(payload, dict):
+        return {"connected": False, "model_found": False}
+    return {"connected": True, "model_found": ollama_model_found(payload, model)}
+
+
 class OllamaStatusWorker(QObject):
     """Ollama /api/tags를 가볍게 확인하는 Worker입니다."""
 
-    finished = Signal(bool)
+    finished = Signal(object)  # {"connected": bool, "model_found": bool}
 
-    def __init__(self, base_url: str, timeout: float = 3.0) -> None:
+    def __init__(self, base_url: str, model: str = "", timeout: float = 3.0) -> None:
         super().__init__()
-        self._base_url = base_url.rstrip("/")
+        self._base_url = base_url
+        self._model = model
         self._timeout = timeout
 
     def run(self) -> None:
-        import json
-        from urllib.request import Request, urlopen
-
-        try:
-            request = Request(f"{self._base_url}/api/tags", method="GET")
-            with urlopen(request, timeout=self._timeout) as response:
-                payload = json.loads(response.read().decode("utf-8"))
-            ok = isinstance(payload, dict)
-        except Exception:
-            ok = False
-        self.finished.emit(ok)
+        self.finished.emit(fetch_ollama_status(self._base_url, self._model, self._timeout))
 
 
 class TranslationWorker(QObject):
@@ -92,10 +136,14 @@ class TranslationWorker(QObject):
             )
             summary = translator.translate_all(output_func=lambda _msg: None)
         except Exception as error:
+            # 예외 종료: failed만 emit하고 finished/stopped는 emit하지 않습니다.
             self.failed.emit(str(error))
             return
         if getattr(summary, "was_stopped", False):
+            # 사용자 중지: stopped만 emit하고 finished는 emit하지 않습니다.
+            # (둘 다 emit하면 GUI가 "중지됨" 위로 "완료 100%"를 덮어씁니다.)
             self.stopped.emit()
+            return
         self.finished.emit(summary)
 
     def _on_progress(
