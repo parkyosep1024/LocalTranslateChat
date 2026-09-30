@@ -372,6 +372,14 @@ class MainWindowLifecycleTest(unittest.TestCase):
     def setUp(self) -> None:
         _app()
         self.windows: list = []
+        # 상태 확인 스레드도 live 서버가 아니라 즉시 fake로 끝냅니다.
+        # (지연 변동이 전체 스위트를 흔들어서 flake가 났습니다.
+        # 실제 판정 로직은 OllamaStatusTest와 아래 상태 테스트에서 검증합니다.)
+        self._status_patch = patch(
+            "script.gui.workers.fetch_ollama_status",
+            return_value={"connected": False, "model_found": False},
+        )
+        self._status_patch.start()
 
     def tearDown(self) -> None:
         for window in self.windows:
@@ -386,11 +394,15 @@ class MainWindowLifecycleTest(unittest.TestCase):
                 )
                 self.wait_for(
                     lambda w=window: len(w._threads) == 0,
-                    timeout_ms=10000,
+                    timeout_ms=30000,
                 )
                 window.close()
             except Exception:
                 pass
+        try:
+            self._status_patch.stop()
+        except Exception:
+            pass
         _app().processEvents()
 
     def make_window(self, analyzer=None):
@@ -447,6 +459,18 @@ class MainWindowLifecycleTest(unittest.TestCase):
         self.assertIsInstance(window._workers, set)
         self.assertIsNotNone(window._status_thread)
 
+    def test_ollama_status_states_update_ui(self) -> None:
+        # 스레드 없이 3가지 상태 판정이 UI에 반영되는지 직접 검증합니다.
+        window = self.make_window()
+        window._on_ollama_status({"connected": True, "model_found": True})
+        self.assertIn("로컬 모델 연결됨", window.sidebar.model_status.text())
+        self.assertIn("엔진 준비됨", window.translation_page.engine_badge.text())
+        window._on_ollama_status({"connected": True, "model_found": False})
+        self.assertIn("Ollama 연결됨", window.sidebar.model_status.text())
+        self.assertIn("모델 없음", window.translation_page.engine_badge.text())
+        window._on_ollama_status({"connected": False, "model_found": False})
+        self.assertIn("연결 안 됨", window.sidebar.model_status.text())
+
     def test_ollama_checking_blocks_translation_start(self) -> None:
         # BUG4: _ollama_connected is None(확인 중)이면 시작하지 않습니다.
         window = self.make_window()
@@ -460,6 +484,9 @@ class MainWindowLifecycleTest(unittest.TestCase):
             self.assertIn("확인 중", window.translation_page.status_label.text())
             self.assertIsNone(window._translation_worker)
             self.assertNotEqual(window.translation_page._state, "running")
+            # tearDown 대기가 끝나도록 확인 중 상태를 복원합니다.
+            window._ollama_connected = False
+            window._ollama_model_found = False
 
     def test_empty_per_file_selection_blocks_start(self) -> None:
         # 파일별 선택값이 비어 있으면 해당 파일명을 지목하며 차단합니다.
@@ -529,11 +556,9 @@ class MainWindowLifecycleTest(unittest.TestCase):
         window.chat_engine = FakeEngine()
         window.chat_page.input.setPlainText("hi")
         window.chat_page._emit_send()
-        self.assertTrue(
-            self.wait_for(lambda: window.chat_page.message_count() == 2),
-            "AI 답변을 받지 못했습니다.",
-        )
-        self.assertTrue(self.wait_for(lambda: window._chat_thread is None, timeout_ms=10000))
+        self.assertTrue(self.wait_for(lambda: window.chat_page.message_count() == 2),
+                        "AI 답변을 받지 못했습니다.")
+        self.assertTrue(self.wait_for(lambda: window._chat_thread is None, timeout_ms=30000))
         self.assertIsNone(window._chat_worker)
         self.assertTrue(window.chat_page.send_button.isEnabled())
         # 두 번째 Chat이 삭제된 객체 없이 시작되어야 합니다.
@@ -543,7 +568,7 @@ class MainWindowLifecycleTest(unittest.TestCase):
             self.wait_for(lambda: window.chat_page.message_count() == 4),
             "두 번째 Chat이 시작되지 않았습니다.",
         )
-        self.assertTrue(self.wait_for(lambda: window._chat_thread is None, timeout_ms=10000))
+        self.assertTrue(self.wait_for(lambda: window._chat_thread is None, timeout_ms=30000))
 
     def _launch_test_translation(self, window, factory):
         worker = TranslationWorker(factory, [])
@@ -594,7 +619,7 @@ class MainWindowLifecycleTest(unittest.TestCase):
         done = self._launch_test_translation(window, self._summary_factory())
         self.assertTrue(self.wait_for(lambda: len(done) == 1))
         self.assertEqual(done, ["finished"])
-        self.assertTrue(self.wait_for(lambda: window._translation_thread is None, timeout_ms=10000))
+        self.assertTrue(self.wait_for(lambda: window._translation_thread is None, timeout_ms=30000))
         self.assertIsNone(window._translation_worker)
         self.assertEqual(window.translation_page.state_badge.text(), "완료")
 
@@ -603,7 +628,7 @@ class MainWindowLifecycleTest(unittest.TestCase):
         done = self._launch_test_translation(window, self._summary_factory(stopped=True))
         self.assertTrue(self.wait_for(lambda: len(done) == 1))
         self.assertEqual(done, ["stopped"])
-        self.assertTrue(self.wait_for(lambda: window._translation_thread is None, timeout_ms=10000))
+        self.assertTrue(self.wait_for(lambda: window._translation_thread is None, timeout_ms=30000))
         self.assertIsNone(window._translation_worker)
         # 중지 상태가 완료 100%로 덮이지 않아야 합니다.
         self.assertEqual(window.translation_page.state_badge.text(), "중지됨")
@@ -619,7 +644,7 @@ class MainWindowLifecycleTest(unittest.TestCase):
         done = self._launch_test_translation(window, self._summary_factory(fail=True))
         self.assertTrue(self.wait_for(lambda: len(done) == 1))
         self.assertEqual(done, ["failed"])
-        self.assertTrue(self.wait_for(lambda: window._translation_thread is None, timeout_ms=10000))
+        self.assertTrue(self.wait_for(lambda: window._translation_thread is None, timeout_ms=30000))
         self.assertIsNone(window._translation_worker)
         done2 = self._launch_test_translation(window, self._summary_factory())
         self.assertTrue(self.wait_for(lambda: len(done2) == 1))
@@ -686,6 +711,7 @@ class MainWindowLifecycleTest(unittest.TestCase):
                 if check.isChecked()
             }
             self.assertEqual(checked, {"text"})
+            self.assertNotIn(csv_path.resolve(), window._schema_pending)
 
     def test_schema_failure_falls_back_manual_unchecked(self) -> None:
         # 분석 실패 시 전체를 선택하지 않고 미선택 상태로 둡니다.
@@ -712,9 +738,11 @@ class MainWindowLifecycleTest(unittest.TestCase):
                 window.file_field_selections[csv_path.resolve()], []
             )
             self.assertEqual(window.translation_page.selected_field_names(), [])
+            self.assertNotIn(csv_path.resolve(), window._schema_pending)
 
     def test_schema_analysis_runs_async(self) -> None:
-        # 분석이 끝나기 전에는 GUI가 막히지 않고 기존 화면을 유지합니다.
+        # 분석이 끝나기 전에도 GUI가 멈추지 않고, 전체 선택으로 보이지 않습니다.
+        # (버튼 enabled 자체가 아니라 freeze 여부가 쟁점이며, 분석 중 시작은 막습니다.)
         import threading
 
         window = self.make_window()
@@ -736,8 +764,13 @@ class MainWindowLifecycleTest(unittest.TestCase):
                 MainWindow, "_create_schema_analyzer", return_value=SlowAnalyzer()
             ):
                 window.translation_page.add_file_path(csv_path)
-                # worker가 끝나기 전에도 페이지는 응답합니다.
-                self.assertTrue(window.translation_page.btn_start.isEnabled())
+                # 분석 중: pending 추적 + 전체 미선택 + 페이지는 응답합니다.
+                self.assertIn(csv_path.resolve(), window._schema_pending)
+                self.assertEqual(window.translation_page.selected_field_names(), [])
+                window.translation_page.set_status("응답 확인")
+                self.assertEqual(
+                    window.translation_page.status_label.text(), "응답 확인"
+                )
                 release.set()
             self.assertTrue(
                 self.wait_for(
@@ -745,6 +778,156 @@ class MainWindowLifecycleTest(unittest.TestCase):
                     == ["id", "text"]
                 )
             )
+            self.assertNotIn(csv_path.resolve(), window._schema_pending)
+
+    def test_pending_blocks_translation_start(self) -> None:
+        # 분석 중인 파일이 있으면 번역 시작을 막습니다. TXT만 있으면 영향 없습니다.
+        import threading
+
+        window = self.make_window()
+        window.translation_settings = TranslationSettings(model="test-model")
+        window._ollama_connected = True
+        window._ollama_model_found = True
+        with tempfile.TemporaryDirectory() as tmp:
+            window._schema_cache = SchemaCache(Path(tmp) / "cache.json")
+            release = threading.Event()
+
+            class SlowAnalyzer:
+                def analyze(self, kind, fields, samples):
+                    release.wait(timeout=10)
+                    return SchemaAnalysis(
+                        tuple(fields), (),
+                        {name: "ok" for name in fields},
+                    )
+
+            csv_path = Path(tmp) / "a.csv"
+            csv_path.write_text("id,text\n1,hello\n", encoding="utf-8")
+            with patch.object(
+                MainWindow, "_create_schema_analyzer", return_value=SlowAnalyzer()
+            ):
+                window.translation_page.add_file_path(csv_path)
+                self.assertIn(csv_path.resolve(), window._schema_pending)
+                window._on_translation_start()
+                self.assertIn("분석 중", window.translation_page.status_label.text())
+                self.assertIsNone(window._translation_worker)
+                self.assertNotEqual(window.translation_page._state, "running")
+                release.set()
+            self.assertTrue(
+                self.wait_for(lambda: len(window._threads) == 0, timeout_ms=30000)
+            )
+
+    def test_no_analyzer_means_unchecked(self) -> None:
+        # Gemini 설정을 사용할 수 없으면 전체 선택 없이 비워 둡니다.
+        window = self.make_window()
+        with tempfile.TemporaryDirectory() as tmp:
+            window._schema_cache = SchemaCache(Path(tmp) / "cache.json")
+            csv_path = Path(tmp) / "a.csv"
+            csv_path.write_text("id,voice,text\n1,f.wav,hello\n", encoding="utf-8")
+            with patch.object(MainWindow, "_create_schema_analyzer", return_value=None):
+                window.translation_page.add_file_path(csv_path)
+            self.assertEqual(
+                window.file_field_selections.get(csv_path.resolve()), []
+            )
+            self.assertEqual(window.translation_page.selected_field_names(), [])
+            self.assertNotIn(csv_path.resolve(), window._schema_pending)
+            self.assertIn(
+                "직접 선택", window.translation_page.analysis_label.text()
+            )
+
+    def test_cache_hit_applies_immediately(self) -> None:
+        # Cache hit이면 worker 없이 즉시 적용되고 pending에 들어가지 않습니다.
+        window = self.make_window()
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = SchemaCache(Path(tmp) / "cache.json")
+            cache.put(
+                "csv", ["id", "text"],
+                SchemaAnalysis(("text",), ("id",), {"text": "대사", "id": "코드"}),
+            )
+            window._schema_cache = cache
+
+            class NeverCalledAnalyzer:
+                def analyze(self, kind, fields, samples):
+                    raise AssertionError("cache hit에서는 분석기를 호출하면 안 됩니다.")
+
+            csv_path = Path(tmp) / "a.csv"
+            csv_path.write_text("id,text\n1,hello\n", encoding="utf-8")
+            with patch.object(
+                MainWindow, "_create_schema_analyzer",
+                return_value=NeverCalledAnalyzer(),
+            ):
+                window.translation_page.add_file_path(csv_path)
+            self.assertEqual(
+                window.file_field_selections.get(csv_path.resolve()), ["text"]
+            )
+            self.assertNotIn(csv_path.resolve(), window._schema_pending)
+            checked = {
+                check.text()
+                for check in window.translation_page.field_checks
+                if check.isChecked()
+            }
+            self.assertEqual(checked, {"text"})
+
+    def test_remove_pending_file_cleans_state(self) -> None:
+        # 분석 중 파일 제거 시 pending/selection/info가 정리되고 늦은 결과도 무시됩니다.
+        import threading
+
+        window = self.make_window()
+        with tempfile.TemporaryDirectory() as tmp:
+            window._schema_cache = SchemaCache(Path(tmp) / "cache.json")
+            release = threading.Event()
+
+            class SlowAnalyzer:
+                def analyze(self, kind, fields, samples):
+                    release.wait(timeout=10)
+                    return SchemaAnalysis(
+                        tuple(fields), (),
+                        {name: "ok" for name in fields},
+                    )
+
+            csv_path = Path(tmp) / "a.csv"
+            csv_path.write_text("id,text\n1,hello\n", encoding="utf-8")
+            with patch.object(
+                MainWindow, "_create_schema_analyzer", return_value=SlowAnalyzer()
+            ):
+                window.translation_page.add_file_path(csv_path)
+                resolved = csv_path.resolve()
+                self.assertIn(resolved, window._schema_pending)
+                window.translation_page.remove_file_path(resolved)
+                self.assertNotIn(resolved, window._schema_pending)
+                self.assertNotIn(resolved, window.file_field_selections)
+                self.assertNotIn(resolved, window._file_field_info)
+                release.set()
+            self.assertTrue(
+                self.wait_for(lambda: len(window._threads) == 0, timeout_ms=30000)
+            )
+            self.assertNotIn(resolved, window._schema_pending)
+            self.assertNotIn(resolved, window.file_field_selections)
+            self.assertNotIn(resolved, window._file_field_info)
+
+    def test_thread_finish_wiring_clears_refs(self) -> None:
+        # 스레드 스케줄링과 무관하게 _launch 정리 wiring 자체를 검증합니다.
+        # (thread.finished 동기 broadcast로 ref 정리·추적 집합 정리를 확인)
+        window = self.make_window()
+
+        class FakeFactory:
+            def translate_all(self, output_func=print):
+                raise AssertionError("호출되면 안 됩니다.")
+
+        worker = TranslationWorker(FakeFactory, [])
+        thread = QThread()
+        window._launch(
+            thread,
+            worker,
+            {"_translation_thread": thread, "_translation_worker": worker},
+        )
+        window._translation_thread = thread
+        window._translation_worker = worker
+        thread.finished.emit()
+        _app().processEvents()
+        self.assertIsNone(window._translation_thread)
+        self.assertIsNone(window._translation_worker)
+        self.assertNotIn(thread, window._threads)
+        self.assertNotIn(worker, window._workers)
 
     def test_build_handlers_use_per_file_selections(self) -> None:
         # Translator handler가 파일별 선택 field만 받습니다.

@@ -221,6 +221,8 @@ class MainWindow(QMainWindow):
         # CSV/JSON 파일별 번역 대상 선택값입니다. TXT는 영향을 받지 않습니다.
         self.file_field_selections: dict[Path, list[str]] = {}
         self._file_field_info: dict[Path, tuple[list[str], dict]] = {}
+        # AI 분석 중인 파일입니다. 결과가 없으므로 전체 선택으로 보여주면 안 됩니다.
+        self._schema_pending: set[Path] = set()
         self._displayed_schema_file: Path | None = None
         self._schema_cache = SchemaCache()
         self._pending_draft: dict | None = None
@@ -509,6 +511,9 @@ class MainWindow(QMainWindow):
         for old in list(self._file_field_info):
             if old not in current:
                 del self._file_field_info[old]
+        for old in list(self._schema_pending):
+            if old not in current:
+                self._schema_pending.discard(old)
         structured = self._structured_files(file_paths)
         if self._displayed_schema_file not in structured:
             self._displayed_schema_file = structured[0] if structured else None
@@ -529,7 +534,10 @@ class MainWindow(QMainWindow):
             )
 
     def _show_displayed_fields(self) -> None:
-        """현재 표시 대상 파일의 field를 checkbox에 보여줍니다."""
+        """현재 표시 대상 파일의 field를 checkbox에 보여줍니다.
+
+        분석 중인 파일은 추천 결과가 없으므로 전체 미선택으로 보여줍니다.
+        """
         path = self._displayed_schema_file
         info = self._file_field_info.get(path) if path is not None else None
         if path is None or info is None:
@@ -540,7 +548,10 @@ class MainWindow(QMainWindow):
             (name, " · ".join(samples.get(name, [])[:2]) or "-")
             for name in available
         ]
-        selected = self.file_field_selections.get(path, list(available))
+        if path in self._schema_pending:
+            selected: list[str] = []
+        else:
+            selected = self.file_field_selections.get(path, list(available))
         self.translation_page.set_fields(rows, selected)
 
     def _create_schema_analyzer(self) -> SchemaAnalyzer | None:
@@ -555,8 +566,10 @@ class MainWindow(QMainWindow):
     def _analyze_file_fields(self, path: Path) -> None:
         """한 구조화 파일의 번역 대상을 결정합니다.
 
-        순서: SchemaCache → Gemini 백그라운드 분석 → (설정 없음) 수동 전체 선택.
-        분석 실패 시 전체 fallback 없이 미선택 상태로 두고 사용자가 고릅니다.
+        순서: SchemaCache hit(즉시 적용, pending 아님)
+        → Gemini 백그라운드 분석(pending)
+        → Gemini 사용 불가(미선택 + 직접 선택 안내).
+        분석 실패 시도 미선택을 유지하고 전체 fallback을 하지 않습니다.
         """
         try:
             handler = create_handler(path)
@@ -569,11 +582,13 @@ class MainWindow(QMainWindow):
             return
         kind = path.suffix.lower().lstrip(".")
         self._file_field_info[path] = (available, samples)
+        self._schema_pending.add(path)
         try:
             cached = self._schema_cache.get(kind, available)
         except Exception:
             cached = None
         if cached is not None:
+            self._schema_pending.discard(path)
             self.file_field_selections[path] = list(cached.translate_fields)
             if path == self._displayed_schema_file:
                 self._show_displayed_fields()
@@ -581,12 +596,18 @@ class MainWindow(QMainWindow):
             return
         analyzer = self._create_schema_analyzer()
         if analyzer is None:
-            # 오프라인 수동 모드: 기존 동작(전체 선택)을 유지합니다.
-            self.file_field_selections[path] = list(available)
+            # AI 분석을 사용할 수 없으면 자동 선택 없이 비워 둡니다.
+            self._schema_pending.discard(path)
+            self.file_field_selections[path] = []
             if path == self._displayed_schema_file:
                 self._show_displayed_fields()
+                self.translation_page.set_analysis_status(
+                    f"{path.name}: AI 분석을 사용할 수 없습니다. 번역할 항목을 직접 선택해주세요."
+                )
             return
         self.translation_page.set_analysis_status(f"{path.name}: AI 분석 중...")
+        if path == self._displayed_schema_file:
+            self._show_displayed_fields()
         worker = SchemaAnalysisWorker(analyzer, str(path), kind, available, samples)
         thread = QThread(self)
         worker.moveToThread(thread)
@@ -603,6 +624,7 @@ class MainWindow(QMainWindow):
             path = Path(str(key))
         except Exception:
             return
+        self._schema_pending.discard(path)
         if path not in self.translation_page.selected_paths():
             return
         translate_fields = list(getattr(analysis, "translate_fields", []))
@@ -625,6 +647,7 @@ class MainWindow(QMainWindow):
             path = Path(str(key))
         except Exception:
             return
+        self._schema_pending.discard(path)
         if path not in self.translation_page.selected_paths():
             return
         # 실패 fallback: 전체를 무조건 선택하지 않고 미선택 상태로 둡니다.
@@ -636,8 +659,9 @@ class MainWindow(QMainWindow):
             )
 
     def _sync_displayed_selection(self) -> None:
-        if self._displayed_schema_file is not None:
-            self.file_field_selections[self._displayed_schema_file] = (
+        displayed = self._displayed_schema_file
+        if displayed is not None and displayed not in self._schema_pending:
+            self.file_field_selections[displayed] = (
                 self.translation_page.selected_field_names()
             )
 
@@ -678,6 +702,16 @@ class MainWindow(QMainWindow):
         # 파일별 선택값으로 검증합니다. 비어 있는 파일이 있으면 시작을 막습니다.
         # 전체 fallback이나 잘못된 field 자동 번역을 하지 않습니다.
         self._sync_displayed_selection()
+        pending = [
+            path
+            for path in file_paths
+            if path.suffix.lower() in {".csv", ".json"} and path in self._schema_pending
+        ]
+        if pending:
+            self.translation_page.set_status(
+                "AI가 번역 대상을 분석 중입니다. 분석이 끝난 후 번역을 시작해주세요."
+            )
+            return
         missing = validate_per_file_selections(file_paths, self.file_field_selections)
         if missing:
             names = "\n".join(f"· {path.name}" for path in missing)
