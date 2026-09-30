@@ -1,4 +1,4 @@
-"""AI 챗봇 화면입니다. 첨부 이미지 2번을 기준으로 구현합니다."""
+"""AI 챗봇 화면입니다. 초기 상태는 빈 상태이며 Gemini ChatEngine에 연결됩니다."""
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
@@ -6,7 +6,6 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QListWidget,
-    QListWidgetItem,
     QPushButton,
     QScrollArea,
     QTextEdit,
@@ -31,16 +30,7 @@ class ChatPage(QWidget):
 
         root.addWidget(self._build_history_column(), 0)
         root.addWidget(self._build_chat_column(), 1)
-
-        # 디자인 확인용 더미 대화
-        self.add_user_message("일본어 게임 대사 “やっと会えたね、ずっと待ってたよ。”를 한국어로 자연스럽게 번역해줘. 오랜 친구를 다시 만난 따뜻한 장면이야.")
-        self.add_ai_message(
-            "자연스러운 번역은 “드디어 만났네. 계속 기다리고 있었어.”입니다. "
-            "친한 사이의 따뜻한 재회 장면이라 문장을 짧게 끊어 감정을 살리는 편이 좋습니다.",
-            tip="좀 더 반가움을 강조하려면 “드디어 만났구나! 정말 오래 기다렸어.”로 조정할 수 있어요.",
-        )
-        self.add_user_message("캐릭터가 차분한 성격이라 느낌표는 빼고, 조금 더 애틋하게 바꿔줘.")
-        self.add_ai_message("“드디어 만났네. 계속… 기다리고 있었어.”가 잘 어울립니다. 말줄임표가 차분한 호흡과 기다림의 시간을 함께 전달해 줍니다.")
+        self._refresh_empty_state()
 
     # ---------- 좌측 ----------
     def _build_history_column(self) -> QWidget:
@@ -66,17 +56,11 @@ class ChatPage(QWidget):
 
         self.history_list = QListWidget()
         self.history_list.setStyleSheet("QListWidget { border: none; }")
-        for title, meta, selected in [
-            ("게임 대사 자연스럽게 다듬기", "오늘 · 10:42", True),
-            ("일본어 경어 뉘앙스 질문", "어제 · 18:21", False),
-            ("CSV 용어집 정리", "9월 27일", False),
-            ("아이템 설명 번역 검토", "9월 25일", False),
-        ]:
-            item = QListWidgetItem(f"{title}\n{meta}")
-            self.history_list.addItem(item)
-            if selected:
-                self.history_list.setCurrentItem(item)
         layout.addWidget(self.history_list, 1)
+        self.empty_history_label = QLabel("저장된 대화가 없습니다.")
+        self.empty_history_label.setObjectName("TinyMuted")
+        self.empty_history_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(self.empty_history_label)
 
         model_box = QFrame()
         model_box.setObjectName("StatusBox")
@@ -85,13 +69,14 @@ class ChatPage(QWidget):
         row1 = QHBoxLayout()
         row1.addWidget(QLabel("현재 모델"))
         row1.addStretch(1)
-        value1 = QLabel("Qwen2.5 14B")
-        value1.setStyleSheet("font-weight: 700;")
-        row1.addWidget(value1)
+        self.model_value = QLabel("-")
+        self.model_value.setStyleSheet("font-weight: 700;")
+        row1.addWidget(self.model_value)
         row2 = QHBoxLayout()
         row2.addWidget(QLabel("컨텍스트"))
         row2.addStretch(1)
-        row2.addWidget(QLabel("3,240 / 16K"))
+        self.context_value = QLabel("-")
+        row2.addWidget(self.context_value)
         model_layout.addLayout(row1)
         model_layout.addLayout(row2)
         layout.addWidget(model_box)
@@ -108,12 +93,12 @@ class ChatPage(QWidget):
 
         header = QHBoxLayout()
         title_col = QVBoxLayout()
-        title = QLabel("게임 대사 자연스럽게 다듬기")
-        title.setStyleSheet("font-size: 17px; font-weight: 800;")
-        sub = QLabel("● 번역 도우미 · 로컬 모델")
-        sub.setObjectName("TinyMuted")
-        title_col.addWidget(title)
-        title_col.addWidget(sub)
+        self.title_label = QLabel("새 대화")
+        self.title_label.setStyleSheet("font-size: 17px; font-weight: 800;")
+        self.subtitle_label = QLabel("연결 확인 중")
+        self.subtitle_label.setObjectName("TinyMuted")
+        title_col.addWidget(self.title_label)
+        title_col.addWidget(self.subtitle_label)
         header.addLayout(title_col, 1)
         export_btn = QPushButton("⤓  대화 내보내기")
         export_btn.setObjectName("SecondaryButton")
@@ -134,6 +119,10 @@ class ChatPage(QWidget):
         self.messages_layout = QVBoxLayout(self.messages_host)
         self.messages_layout.setContentsMargins(12, 8, 12, 8)
         self.messages_layout.setSpacing(10)
+        self.empty_chat_label = QLabel("새 대화를 시작해보세요.")
+        self.empty_chat_label.setObjectName("Muted")
+        self.empty_chat_label.setAlignment(Qt.AlignCenter)
+        self.messages_layout.addWidget(self.empty_chat_label)
         self.messages_layout.addStretch(1)
         self.scroll.setWidget(self.messages_host)
         container.addWidget(self.scroll, 1)
@@ -164,7 +153,15 @@ class ChatPage(QWidget):
         return host
 
     # ---------- 메시지 ----------
-    def _bubble(self, text: str, is_user: bool, tip: str = "") -> QWidget:
+    def message_count(self) -> int:
+        count = 0
+        for i in range(self.messages_layout.count()):
+            item = self.messages_layout.itemAt(i)
+            if item.widget() is not None and item.widget() is not self.empty_chat_label:
+                count += 1
+        return count
+
+    def _bubble(self, text: str, is_user: bool, is_error: bool = False) -> QWidget:
         row = QHBoxLayout()
         bubble = QFrame()
         bubble.setObjectName("Card")
@@ -173,23 +170,20 @@ class ChatPage(QWidget):
                 "QFrame#Card { background: #2F6FED; color: white; border: none; "
                 "border-radius: 12px; }"
             )
+        elif is_error:
+            bubble.setStyleSheet(
+                "QFrame#Card { background: #FDECEC; border: 1px solid #F5C6C2; "
+                "border-radius: 12px; }"
+            )
         layout = QVBoxLayout(bubble)
         layout.setContentsMargins(12, 10, 12, 10)
         content = QLabel(text)
         content.setWordWrap(True)
         if is_user:
             content.setStyleSheet("color: white;")
+        elif is_error:
+            content.setStyleSheet("color: #B3261E;")
         layout.addWidget(content)
-        if tip and not is_user:
-            tip_box = QFrame()
-            tip_box.setObjectName("StatusBox")
-            tip_layout = QHBoxLayout(tip_box)
-            tip_layout.setContentsMargins(8, 6, 8, 6)
-            tip_label = QLabel(f"ⓘ  {tip}")
-            tip_label.setWordWrap(True)
-            tip_label.setObjectName("Muted")
-            tip_layout.addWidget(tip_label)
-            layout.addWidget(tip_box)
 
         if is_user:
             row.addStretch(1)
@@ -213,23 +207,55 @@ class ChatPage(QWidget):
         self.messages_layout.insertWidget(
             self.messages_layout.count() - 1, self._bubble(text, True)
         )
+        self._refresh_empty_state()
         self._scroll_to_bottom()
 
-    def add_ai_message(self, text: str, tip: str = "") -> None:
+    def add_ai_message(self, text: str) -> None:
         self.messages_layout.insertWidget(
-            self.messages_layout.count() - 1, self._bubble(text, False, tip)
+            self.messages_layout.count() - 1, self._bubble(text, False)
         )
+        self._refresh_empty_state()
+        self._scroll_to_bottom()
+
+    def add_error_message(self, text: str) -> None:
+        """backend 오류를 GUI 프로세스 종료 없이 표시합니다."""
+        self.messages_layout.insertWidget(
+            self.messages_layout.count() - 1, self._bubble(text, False, is_error=True)
+        )
+        self._refresh_empty_state()
         self._scroll_to_bottom()
 
     def clear_messages(self) -> None:
-        while self.messages_layout.count() > 1:
-            item = self.messages_layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
+        for i in reversed(range(self.messages_layout.count())):
+            item = self.messages_layout.itemAt(i)
+            widget = item.widget() if item is not None else None
+            if widget is not None and widget is not self.empty_chat_label:
+                self.messages_layout.removeWidget(widget)
+                widget.deleteLater()
+        if self.empty_chat_label not in [
+            self.messages_layout.itemAt(i).widget()
+            for i in range(self.messages_layout.count())
+        ]:
+            self.messages_layout.insertWidget(0, self.empty_chat_label)
+        self._refresh_empty_state()
 
-    def set_model_info(self, model: str, context: str) -> None:
-        """향후 ChatEngine/설정 연결 지점입니다(현재는 더미 표시 유지)."""
-        _ = (model, context)
+    def set_model_info(self, model: str, context: str = "-") -> None:
+        """실제 Settings 모델명을 표시합니다. 연결 전이면 '-'를 사용합니다."""
+        self.model_value.setText(model or "-")
+        self.context_value.setText(context or "-")
+        if model and model != "-":
+            self.subtitle_label.setText(f"● 번역 도우미 · {model}")
+        else:
+            self.subtitle_label.setText("○ 모델 미연결")
+
+    def set_sending(self, busy: bool) -> None:
+        self.send_button.setEnabled(not busy)
+        self.input.setReadOnly(busy)
+
+    def _refresh_empty_state(self) -> None:
+        has_message = self.message_count() > 0
+        self.empty_chat_label.setVisible(not has_message)
+        self.empty_history_label.setVisible(self.history_list.count() == 0)
 
     def _emit_send(self) -> None:
         text = self.input.toPlainText().strip()

@@ -1,35 +1,33 @@
-"""Prompt 설정 화면입니다. 첨부 이미지 3번을 기준으로 구현합니다."""
+"""Prompt 설정 화면입니다. 실제 PromptManager 데이터에 연결됩니다."""
 
-from PySide6.QtCore import Signal
+from pathlib import Path
+
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QComboBox,
+    QFileDialog,
     QFrame,
     QHBoxLayout,
     QLabel,
-    QLineEdit,
+    QMessageBox,
     QPushButton,
+    QScrollArea,
     QTextEdit,
     QVBoxLayout,
     QWidget,
 )
 
-from script.gui.widgets import Card, muted_label, section_header
+from script.gui.widgets import Card, muted_label
+from script.translation.prompt_manager import PromptManager, PromptPreset
+from script.utils.exceptions import ChatbotError
 
 
 class PromptListCard(QFrame):
     """저장된 Prompt 1행 카드입니다."""
 
-    def __init__(
-        self,
-        title: str,
-        source: str,
-        target: str,
-        doc_type: str,
-        updated: str,
-        selected: bool = False,
-        parent=None,
-    ) -> None:
+    def __init__(self, preset: PromptPreset, selected: bool = False, parent=None) -> None:
         super().__init__(parent)
+        self.preset = preset
         self.setObjectName("PromptCard")
         self.setProperty("selected", selected)
         layout = QVBoxLayout(self)
@@ -37,7 +35,7 @@ class PromptListCard(QFrame):
         layout.setSpacing(6)
 
         title_row = QHBoxLayout()
-        name = QLabel(title)
+        name = QLabel(preset.name)
         name.setStyleSheet("font-weight: 800;")
         title_row.addWidget(name, 1)
         if selected:
@@ -47,16 +45,16 @@ class PromptListCard(QFrame):
         layout.addLayout(title_row)
 
         meta_row = QHBoxLayout()
-        meta_row.addWidget(self._chip(source))
+        meta_row.addWidget(self._chip(preset.source_language))
         arrow = QLabel("→")
         arrow.setObjectName("TinyMuted")
         meta_row.addWidget(arrow)
-        meta_row.addWidget(self._chip(target))
-        meta_row.addWidget(self._chip(doc_type))
+        meta_row.addWidget(self._chip(preset.target_language))
+        meta_row.addWidget(self._chip(preset.document_type))
         meta_row.addStretch(1)
         layout.addLayout(meta_row)
 
-        updated_label = QLabel(f"최근 수정 {updated}")
+        updated_label = QLabel(f"최근 수정 {preset.updated_at}")
         updated_label.setObjectName("TinyMuted")
         layout.addWidget(updated_label)
 
@@ -73,15 +71,14 @@ class PromptListCard(QFrame):
 class PromptPage(QWidget):
     """좌측 Prompt 목록 + 우측 Prompt Editor 화면입니다."""
 
-    new_requested = Signal()
-    save_requested = Signal()
-    cancel_requested = Signal()
-    delete_requested = Signal()
-    import_requested = Signal()
-    export_requested = Signal()
-
-    def __init__(self, parent=None) -> None:
+    def __init__(self, manager: PromptManager | None = None, parent=None) -> None:
         super().__init__(parent)
+        self.manager = manager or PromptManager()
+        self.presets: list[PromptPreset] = []
+        self.current: PromptPreset | None = None
+        self.is_new = False
+        self._cards: list[PromptListCard] = []
+
         root = QVBoxLayout(self)
         root.setContentsMargins(20, 12, 20, 12)
         root.setSpacing(10)
@@ -98,13 +95,13 @@ class PromptPage(QWidget):
 
         import_btn = QPushButton("⤒  TXT/JSON Prompt 가져오기")
         import_btn.setObjectName("SecondaryButton")
-        import_btn.clicked.connect(self.import_requested.emit)
+        import_btn.clicked.connect(self.import_prompt)
         export_btn = QPushButton("⤓  내보내기")
         export_btn.setObjectName("SecondaryButton")
-        export_btn.clicked.connect(self.export_requested.emit)
+        export_btn.clicked.connect(self.export_prompt)
         new_btn = QPushButton("+  새 Prompt 생성")
         new_btn.setObjectName("PrimaryButton")
-        new_btn.clicked.connect(self.new_requested.emit)
+        new_btn.clicked.connect(self.new_prompt)
         header.addWidget(import_btn)
         header.addWidget(export_btn)
         header.addWidget(new_btn)
@@ -116,6 +113,8 @@ class PromptPage(QWidget):
         body.addWidget(self._build_list_card(), 2)
         body.addWidget(self._build_editor_card(), 3)
 
+        self.load_presets()
+
     # ---------- 좌측 ----------
     def _build_list_card(self) -> Card:
         card = Card()
@@ -123,10 +122,10 @@ class PromptPage(QWidget):
         title_col = QVBoxLayout()
         title = QLabel("저장된 Prompt")
         title.setObjectName("SectionTitle")
-        sub = QLabel("총 4개 · 필터 결과 4개")
-        sub.setObjectName("TinyMuted")
+        self.count_label = QLabel("총 0개")
+        self.count_label.setObjectName("TinyMuted")
         title_col.addWidget(title)
-        title_col.addWidget(sub)
+        title_col.addWidget(self.count_label)
         top.addLayout(title_col, 1)
         search = QPushButton("⌕")
         search.setObjectName("SecondaryButton")
@@ -139,12 +138,10 @@ class PromptPage(QWidget):
         src_col = QVBoxLayout()
         src_col.addWidget(QLabel("원본 언어"))
         self.filter_source = QComboBox()
-        self.filter_source.addItems(["Japanese", "English", "Korean"])
         src_col.addWidget(self.filter_source)
         tgt_col = QVBoxLayout()
         tgt_col.addWidget(QLabel("목표 언어"))
         self.filter_target = QComboBox()
-        self.filter_target.addItems(["Korean", "English"])
         tgt_col.addWidget(self.filter_target)
         row1.addLayout(src_col, 1)
         row1.addLayout(tgt_col, 1)
@@ -152,24 +149,34 @@ class PromptPage(QWidget):
         doc_col = QVBoxLayout()
         doc_col.addWidget(QLabel("문서 유형"))
         self.filter_doc = QComboBox()
-        self.filter_doc.addItems(["전체 · novel / game_dialogue", "novel", "game_dialogue", "game_ui"])
         doc_col.addWidget(self.filter_doc)
         filter_grid.addLayout(doc_col)
         card.inner.addLayout(filter_grid)
+        self.filter_source.currentTextChanged.connect(lambda _=None: self._apply_filter())
+        self.filter_target.currentTextChanged.connect(lambda _=None: self._apply_filter())
+        self.filter_doc.currentTextChanged.connect(lambda _=None: self._apply_filter())
 
-        path = QLabel("Japanese  →  Korean  →  문서 유형별 4개")
-        path.setObjectName("Muted")
-        path.setStyleSheet("background: #F7F9FC; border-radius: 6px; padding: 6px 8px;")
-        card.inner.addWidget(path)
+        self.filter_path_label = QLabel("-")
+        self.filter_path_label.setObjectName("Muted")
+        self.filter_path_label.setStyleSheet(
+            "background: #F7F9FC; border-radius: 6px; padding: 6px 8px;"
+        )
+        card.inner.addWidget(self.filter_path_label)
 
-        for title, src, tgt, doc, updated, selected in [
-            ("게임 대사 · 감정 보존 v3", "Japanese", "Korean", "game_dialogue", "2026.09.27", True),
-            ("비주얼 노벨 · 서술체", "Japanese", "Korean", "novel", "2026.09.21", False),
-            ("게임 UI · 짧은 문구", "Japanese", "Korean", "game_ui", "2026.09.18", False),
-            ("아이템 및 스킬 설명", "Japanese", "Korean", "item_description", "2026.09.11", False),
-        ]:
-            card.inner.addWidget(PromptListCard(title, src, tgt, doc, updated, selected))
-        card.inner.addStretch(1)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        host = QWidget()
+        self.preset_box = QVBoxLayout(host)
+        self.preset_box.setContentsMargins(0, 0, 0, 0)
+        self.preset_box.setSpacing(8)
+        self.empty_preset_label = QLabel("저장된 Prompt가 없습니다.")
+        self.empty_preset_label.setObjectName("Muted")
+        self.empty_preset_label.setAlignment(Qt.AlignCenter)
+        self.preset_box.addWidget(self.empty_preset_label)
+        self.preset_box.addStretch(1)
+        scroll.setWidget(host)
+        card.inner.addWidget(scroll, 1)
         return card
 
     # ---------- 우측 ----------
@@ -179,87 +186,81 @@ class PromptPage(QWidget):
         top = QHBoxLayout()
         title_col = QVBoxLayout()
         title_col.setSpacing(1)
-        title = QLabel("게임 대사 · 감정 보존 v3")
-        title.setStyleSheet("font-size: 15px; font-weight: 800;")
-        sub = QLabel("Japanese  →  Korean / game_dialogue")
-        sub.setObjectName("Muted")
-        title_col.addWidget(title)
-        title_col.addWidget(sub)
+        self.title_label = QLabel("Prompt를 선택하세요")
+        self.title_label.setStyleSheet("font-size: 15px; font-weight: 800;")
+        self.subtitle_label = QLabel("-")
+        self.subtitle_label.setObjectName("Muted")
+        title_col.addWidget(self.title_label)
+        title_col.addWidget(self.subtitle_label)
         top.addLayout(title_col, 1)
-        ai_btn = QPushButton("✦ AI로 Prompt 생성")
-        ai_btn.setObjectName("SecondaryButton")
-        edit_btn = QPushButton("✎ 수정")
-        edit_btn.setObjectName("PrimaryButton")
-        del_btn = QPushButton("🗑 삭제")
-        del_btn.setObjectName("DangerButton")
-        del_btn.clicked.connect(self.delete_requested.emit)
-        top.addWidget(ai_btn)
-        top.addWidget(edit_btn)
-        top.addWidget(del_btn)
+        self.ai_button = QPushButton("✦ AI로 Prompt 생성")
+        self.ai_button.setObjectName("SecondaryButton")
+        self.edit_button = QPushButton("✎ 수정")
+        self.edit_button.setObjectName("PrimaryButton")
+        self.delete_button = QPushButton("🗑 삭제")
+        self.delete_button.setObjectName("DangerButton")
+        self.delete_button.clicked.connect(self.delete_current)
+        top.addWidget(self.ai_button)
+        top.addWidget(self.edit_button)
+        top.addWidget(self.delete_button)
         card.inner.addLayout(top)
-        self.title_label = title
-        self.edit_button = edit_btn
-        self.ai_button = ai_btn
 
         form = QHBoxLayout()
-        self.source_combo = self._labeled_combo(form, "원본 언어", ["Japanese (ja)", "English (en)", "Korean (ko)"])
-        self.target_combo = self._labeled_combo(form, "목표 언어", ["Korean (ko)", "English (en)", "Japanese (ja)"])
-        self.doc_combo = self._labeled_combo(form, "문서 유형", ["game_dialogue", "novel", "game_ui"])
+        self.source_combo = self._labeled_combo(form, "원본 언어", [])
+        self.target_combo = self._labeled_combo(form, "목표 언어", [])
+        self.doc_edit = self._labeled_line_edit(form, "문서 유형")
         card.inner.addLayout(form)
 
         edit_head = QHBoxLayout()
         edit_head.addWidget(QLabel("Prompt 내용 편집"))
         edit_head.addStretch(1)
-        edit_head.addWidget(muted_label("1,284자 · 자동 저장됨 10:38", "TinyMuted"))
+        self.char_label = QLabel("")
+        self.char_label.setObjectName("TinyMuted")
+        edit_head.addWidget(self.char_label)
         card.inner.addLayout(edit_head)
 
         self.editor = QTextEdit()
-        self.editor.setPlainText(
-            "당신은 일본어 게임 대사를 한국어로 현지화하는 전문 번역가입니다.\n\n"
-            "다음 원칙을 반드시 지켜 번역하세요.\n"
-            "1. 원문의 감정, 캐릭터 성격, 관계성을 우선하여 자연스러운 한국어 대사로 번역합니다.\n"
-            "2. 직역투를 피하고 실제 한국어 화자가 말하는 호흡과 어순을 사용합니다.\n"
-            "3. 고용량식과 반말 용어는 채팅용 용어집을 따르고, 문서 전체에서 일관되게 유지합니다.\n"
-            "4. 존댓말/반말, 호칭, 말버릇을 임의로 바꾸지 않습니다.\n"
-            "5. 변수 표기와 태그(예: {player_name}, <color>)는 번역하거나 삭제하지 않습니다.\n\n"
-            "[출력 형식]\n"
-            "번역문만 출력하며 설명이나 미괄표를 추가하지 않습니다."
-        )
+        self.editor.setPlaceholderText("Prompt를 선택하거나 새로 만드세요.")
         self.editor.setMinimumHeight(260)
+        self.editor.textChanged.connect(self._refresh_char_count)
         card.inner.addWidget(self.editor, 1)
 
         bottom = QHBoxLayout()
-        self.validation_label = QLabel("✔  필수 변수와 출력 형식이 유효합니다.")
-        self.validation_label.setStyleSheet("color: #188038; font-size: 12px;")
+        self.validation_label = QLabel("")
+        self.validation_label.setStyleSheet("color: #6B7A90; font-size: 12px;")
         bottom.addWidget(self.validation_label, 1)
-        cancel_btn = QPushButton("변경 취소")
-        cancel_btn.setObjectName("SecondaryButton")
-        cancel_btn.clicked.connect(self.cancel_requested.emit)
-        save_btn = QPushButton("🖫  변경사항 저장")
-        save_btn.setObjectName("PrimaryButton")
-        save_btn.clicked.connect(self.save_requested.emit)
-        bottom.addWidget(cancel_btn)
-        bottom.addWidget(save_btn)
+        self.cancel_button = QPushButton("변경 취소")
+        self.cancel_button.setObjectName("SecondaryButton")
+        self.cancel_button.clicked.connect(self.cancel_edit)
+        self.save_button = QPushButton("🖫  변경사항 저장")
+        self.save_button.setObjectName("PrimaryButton")
+        self.save_button.clicked.connect(self.save_current)
+        bottom.addWidget(self.cancel_button)
+        bottom.addWidget(self.save_button)
         card.inner.addLayout(bottom)
 
-        stats = QHBoxLayout()
-        stats.addWidget(muted_label("사용 횟수", "TinyMuted"))
-        stats.addStretch(1)
-        stats.addWidget(QLabel("24회"))
-        stats.addStretch(2)
-        stats.addWidget(muted_label("버전", "TinyMuted"))
-        stats.addStretch(1)
-        stats.addWidget(QLabel("v3"))
-        card.inner.addLayout(stats)
-        stats2 = QHBoxLayout()
-        stats2.addWidget(muted_label("마지막 사용", "TinyMuted"))
-        stats2.addStretch(1)
-        stats2.addWidget(QLabel("2026.09.29"))
-        stats2.addStretch(2)
-        stats2.addWidget(muted_label("생성 방식", "TinyMuted"))
-        stats2.addStretch(1)
-        stats2.addWidget(QLabel("AI 초안 + 직접 수정"))
-        card.inner.addLayout(stats2)
+        meta = QHBoxLayout()
+        self.meta_usage = QLabel("-")
+        self.meta_version = QLabel("-")
+        meta.addWidget(muted_label("사용 횟수", "TinyMuted"))
+        meta.addStretch(1)
+        meta.addWidget(self.meta_usage)
+        meta.addStretch(2)
+        meta.addWidget(muted_label("버전", "TinyMuted"))
+        meta.addStretch(1)
+        meta.addWidget(self.meta_version)
+        card.inner.addLayout(meta)
+        meta2 = QHBoxLayout()
+        self.meta_last = QLabel("-")
+        self.meta_created_by = QLabel("-")
+        meta2.addWidget(muted_label("마지막 사용", "TinyMuted"))
+        meta2.addStretch(1)
+        meta2.addWidget(self.meta_last)
+        meta2.addStretch(2)
+        meta2.addWidget(muted_label("생성 방식", "TinyMuted"))
+        meta2.addStretch(1)
+        meta2.addWidget(self.meta_created_by)
+        card.inner.addLayout(meta2)
         return card
 
     @staticmethod
@@ -267,12 +268,283 @@ class PromptPage(QWidget):
         col = QVBoxLayout()
         col.addWidget(QLabel(label))
         combo = QComboBox()
-        combo.addItems(items)
+        combo.setEditable(True)
+        if items:
+            combo.addItems(items)
         col.addWidget(combo)
         parent_layout.addLayout(col, 1)
         return combo
 
-    # ---------- backend 연결 지점 (현재는 UI 상태만 변경) ----------
+    @staticmethod
+    def _labeled_line_edit(parent_layout, label: str):
+        from PySide6.QtWidgets import QLineEdit
+
+        col = QVBoxLayout()
+        col.addWidget(QLabel(label))
+        edit = QLineEdit()
+        edit.setPlaceholderText("예: game_dialogue")
+        col.addWidget(edit)
+        parent_layout.addLayout(col, 1)
+        return edit
+
+    # ---------- 실제 데이터 로드 ----------
+    def load_presets(self) -> None:
+        try:
+            self.presets = self.manager.list_presets()
+        except ChatbotError as error:
+            self.presets = []
+            self.set_validation(False, f"Preset 불러오기 실패: {error}")
+        self._refresh_filter_options()
+        self._apply_filter()
+        if self.current is None and not self.is_new:
+            self._show_empty_editor()
+
+    def _refresh_filter_options(self) -> None:
+        def options(values: list[str]) -> list[str]:
+            return ["전체"] + sorted(set(values), key=str.casefold)
+
+        src = options([p.source_language for p in self.presets])
+        tgt = options([p.target_language for p in self.presets])
+        doc = options([p.document_type for p in self.presets])
+        for combo, items in (
+            (self.filter_source, src),
+            (self.filter_target, tgt),
+            (self.filter_doc, doc),
+        ):
+            current = combo.currentText()
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItems(items)
+            if current in items:
+                combo.setCurrentText(current)
+            combo.blockSignals(False)
+
+    def _apply_filter(self) -> None:
+        src = self.filter_source.currentText() if self.filter_source.count() else "전체"
+        tgt = self.filter_target.currentText() if self.filter_target.count() else "전체"
+        doc = self.filter_doc.currentText() if self.filter_doc.count() else "전체"
+        filtered = [
+            p
+            for p in self.presets
+            if (src in ("", "전체") or p.source_language == src)
+            and (tgt in ("", "전체") or p.target_language == tgt)
+            and (doc in ("", "전체") or p.document_type == doc)
+        ]
+        self.count_label.setText(f"총 {len(self.presets)}개 · 필터 결과 {len(filtered)}개")
+        self.filter_path_label.setText(f"{src}  →  {tgt}  →  {doc}")
+
+        for card in self._cards:
+            self.preset_box.removeWidget(card)
+            card.deleteLater()
+        self._cards = []
+        for preset in filtered:
+            card = PromptListCard(
+                preset,
+                selected=self.current is not None and self._same_scope(preset, self.current),
+            )
+            card.mousePressEvent = self._make_select_handler(preset)  # type: ignore[method-assign]
+            self.preset_box.insertWidget(self.preset_box.count() - 1, card)
+            self._cards.append(card)
+        self.empty_preset_label.setVisible(not filtered)
+
+    @staticmethod
+    def _same_scope(a: PromptPreset, b: PromptPreset) -> bool:
+        return (
+            a.name == b.name
+            and a.source_language == b.source_language
+            and a.target_language == b.target_language
+            and a.document_type == b.document_type
+        )
+
+    def _make_select_handler(self, preset: PromptPreset):
+        def handler(event) -> None:
+            self.select_preset(preset)
+            if event is not None:
+                event.accept()
+
+        return handler
+
+    # ---------- 선택 / 편집 ----------
+    def select_preset(self, preset: PromptPreset) -> None:
+        self.current = preset
+        self.is_new = False
+        self.title_label.setText(preset.name)
+        self.subtitle_label.setText(
+            f"{preset.source_language}  →  {preset.target_language} / {preset.document_type}"
+        )
+        self._set_combo_text(self.source_combo, preset.source_language)
+        self._set_combo_text(self.target_combo, preset.target_language)
+        self.doc_edit.setText(preset.document_type)
+        self.editor.setPlainText(preset.prompt)
+        self.meta_last.setText(preset.updated_at or "-")
+        self.meta_created_by.setText(preset.created_by or "-")
+        self.meta_usage.setText("-")
+        self.meta_version.setText("-")
+        self.set_validation(True, "✔  Preset을 불러왔습니다.")
+        self._set_editor_enabled(True)
+        self._apply_filter()
+
+    def new_prompt(self) -> None:
+        self.current = None
+        self.is_new = True
+        self.title_label.setText("새 Prompt")
+        self.subtitle_label.setText("-")
+        self.source_combo.setCurrentText("")
+        self.target_combo.setCurrentText("")
+        self.doc_edit.clear()
+        self.editor.clear()
+        self.meta_usage.setText("-")
+        self.meta_version.setText("-")
+        self.meta_last.setText("-")
+        self.meta_created_by.setText("-")
+        self.set_validation(True, "새 Prompt를 입력한 뒤 저장하세요.")
+        self._set_editor_enabled(True)
+
+    def cancel_edit(self) -> None:
+        if self.current is not None:
+            self.select_preset(self.current)
+        else:
+            self.is_new = False
+            self._show_empty_editor()
+
+    def save_current(self) -> None:
+        name = self.title_label.text().strip()
+        if self.is_new or self.current is None:
+            name, ok = self._ask_text("새 Preset 이름", "저장할 Preset 이름을 입력하세요:")
+            if not ok or not name.strip():
+                return
+            name = name.strip()
+        source = self.source_combo.currentText().strip()
+        target = self.target_combo.currentText().strip()
+        doc_type = self.doc_edit.text().strip()
+        prompt = self.editor.toPlainText().strip()
+        if not source or not target or not doc_type or not prompt:
+            self.set_validation(False, "원본 언어, 목표 언어, 문서 유형, Prompt를 모두 입력하세요.")
+            return
+        try:
+            if self.is_new or self.current is None:
+                preset = self.manager.create_preset(name, source, target, doc_type, prompt, "Manual")
+                self.manager.save(preset, overwrite=False)
+            else:
+                updated, _ = self.manager.update(
+                    self.current,
+                    name=name if name != "Prompt를 선택하세요" else self.current.name,
+                    source_language=source,
+                    target_language=target,
+                    document_type=doc_type,
+                    prompt=prompt,
+                )
+                self.current = updated
+                self.is_new = False
+            self.set_validation(True, "✔  저장했습니다.")
+        except ChatbotError as error:
+            self.set_validation(False, f"저장 실패: {error}")
+            return
+        self.load_presets()
+
+    def delete_current(self) -> None:
+        if self.current is None:
+            return
+        answer = QMessageBox.question(self, "삭제 확인", f"'{self.current.name}'을 삭제할까요?")
+        if answer != QMessageBox.Yes:
+            return
+        try:
+            self.manager.delete(self.current)
+        except ChatbotError as error:
+            self.set_validation(False, f"삭제 실패: {error}")
+            return
+        self.current = None
+        self.is_new = False
+        self.load_presets()
+
+    def import_prompt(self) -> None:
+        path_str, _ = QFileDialog.getOpenFileName(
+            self, "Prompt 가져오기", "", "Prompt (*.txt *.json)"
+        )
+        if not path_str:
+            return
+        path = Path(path_str)
+        try:
+            if path.suffix.lower() == ".txt":
+                name, ok = self._ask_text("가져오기", "Preset 이름을 입력하세요:")
+                if not ok or not name.strip():
+                    return
+                source, ok = self._ask_text("원본 언어", "원본 언어를 입력하세요 (예: Japanese):")
+                if not ok:
+                    return
+                target, ok = self._ask_text("목표 언어", "목표 언어를 입력하세요 (예: Korean):")
+                if not ok:
+                    return
+                doc, ok = self._ask_text("문서 유형", "문서 유형을 입력하세요 (예: game_dialogue):")
+                if not ok:
+                    return
+                self.manager.import_txt(path, name.strip(), source.strip(), target.strip(), doc.strip())
+            else:
+                self.manager.import_json(path)
+            self.set_validation(True, "✔  가져왔습니다.")
+        except ChatbotError as error:
+            self.set_validation(False, f"가져오기 실패: {error}")
+            return
+        self.load_presets()
+
+    def export_prompt(self) -> None:
+        if self.current is None:
+            self.set_validation(False, "내보낼 Prompt를 먼저 선택하세요.")
+            return
+        path_str, _ = QFileDialog.getSaveFileName(
+            self, "Prompt 내보내기", f"{self.current.name}.json", "JSON (*.json);;Text (*.txt)"
+        )
+        if not path_str:
+            return
+        try:
+            destination = Path(path_str)
+            if destination.suffix.lower() == ".txt":
+                self.manager.export_txt(self.current, destination)
+            else:
+                self.manager.export_json(self.current, destination)
+            self.set_validation(True, "✔  내보냈습니다.")
+        except ChatbotError as error:
+            self.set_validation(False, f"내보내기 실패: {error}")
+
+    # ---------- 내부 ----------
+    def _show_empty_editor(self) -> None:
+        self.title_label.setText("Prompt를 선택하세요")
+        self.subtitle_label.setText("-")
+        self.editor.clear()
+        self.meta_usage.setText("-")
+        self.meta_version.setText("-")
+        self.meta_last.setText("-")
+        self.meta_created_by.setText("-")
+        self.char_label.setText("")
+        self.set_validation(True, "왼쪽 목록에서 Prompt를 선택하세요.")
+        self._set_editor_enabled(False)
+
+    def _set_editor_enabled(self, enabled: bool) -> None:
+        self.editor.setReadOnly(not enabled)
+        self.save_button.setEnabled(enabled)
+        self.cancel_button.setEnabled(enabled)
+        self.delete_button.setEnabled(enabled and self.current is not None)
+        self.source_combo.setEnabled(enabled)
+        self.target_combo.setEnabled(enabled)
+        self.doc_edit.setEnabled(enabled)
+
+    def _refresh_char_count(self) -> None:
+        self.char_label.setText(f"{len(self.editor.toPlainText())}자")
+
+    @staticmethod
+    def _set_combo_text(combo: QComboBox, text: str) -> None:
+        combo.blockSignals(True)
+        if combo.findText(text) < 0:
+            combo.addItem(text)
+        combo.setCurrentText(text)
+        combo.blockSignals(False)
+
+    def _ask_text(self, title: str, label: str) -> tuple[str, bool]:
+        from PySide6.QtWidgets import QInputDialog
+
+        return QInputDialog.getText(self, title, label)
+
+    # ---------- backend 연결 지점 ----------
     def set_validation(self, ok: bool, message: str) -> None:
         self.validation_label.setText(message)
         color = "#188038" if ok else "#D93025"

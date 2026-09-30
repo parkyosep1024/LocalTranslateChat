@@ -64,6 +64,7 @@ class Translator:
         handlers: dict[Path, FormatHandler] | None = None,
         file_paths: list[Path] | None = None,
         on_file_succeeded: Callable[[Path], None] | None = None,
+        on_progress: Callable[[Path, int, int, int, int], None] | None = None,
     ) -> None:
         self.loader = loader
         self.local_llm = local_llm
@@ -77,6 +78,9 @@ class Translator:
         self.handlers = handlers or {}
         self.file_paths = file_paths
         self.on_file_succeeded = on_file_succeeded
+        # GUI 진행률용 작은 callback입니다. CLI 동작에는 영향을 주지 않습니다.
+        # (file_path, current_unit, total_units, file_index, total_files)
+        self.on_progress = on_progress
 
     def translate_all(
         self,
@@ -106,7 +110,11 @@ class Translator:
 
             output_func(f"[{index}/{total}] 번역 시작: {input_path.name}")
             try:
-                translated_text = self._translate_file(input_path)
+                translated_text = self._translate_file(
+                    input_path,
+                    file_index=index,
+                    total_files=total,
+                )
                 self.writer.write(input_path, translated_text)
             except TranslationStopped:
                 output_func("번역이 사용자 요청으로 중지되었습니다.")
@@ -147,7 +155,12 @@ class Translator:
             by_format={ext: tuple(value) for ext, value in counts.items()},
         )
 
-    def _translate_file(self, input_path: Path) -> str:
+    def _translate_file(
+        self,
+        input_path: Path,
+        file_index: int = 1,
+        total_files: int = 1,
+    ) -> str:
         handler = self.handlers.get(input_path)
         if handler is None:
             handler = create_handler(input_path, self.chunk_max_chars)
@@ -156,6 +169,7 @@ class Translator:
         if not units:
             raise ValueError("번역 대상 텍스트가 없습니다.")
         translations: dict[str, str] = {}
+        total_units = len(units)
         for index, unit in enumerate(units):
             protected, placeholders = protect_placeholders(unit.text)
             translated = self.local_llm.generate(
@@ -167,6 +181,11 @@ class Translator:
                 )
             )
             translations[unit.key] = restore_placeholders(translated, placeholders)
+            if self.on_progress is not None:
+                try:
+                    self.on_progress(input_path, index + 1, total_units, file_index, total_files)
+                except Exception:
+                    pass
             if index < len(units) - 1 and self.stop_requested():
                 raise TranslationStopped("사용자가 번역 중지를 요청했습니다.")
         handler.apply_translations(translations)
