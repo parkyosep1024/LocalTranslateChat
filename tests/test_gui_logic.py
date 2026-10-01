@@ -952,6 +952,151 @@ class MainWindowLifecycleTest(unittest.TestCase):
         _app().processEvents()
         self.assertFalse(window.isVisible())
 
+    def test_no_duplicate_analysis_on_refiles_changed(self) -> None:
+        # A. 분석 중 files_changed가 다시 발생해도 같은 파일은 1회만 분석합니다.
+        import threading
+
+        window = self.make_window()
+        with tempfile.TemporaryDirectory() as tmp:
+            window._schema_cache = SchemaCache(Path(tmp) / "cache.json")
+            release = threading.Event()
+            calls: list[str] = []
+
+            class CountingSlowAnalyzer:
+                def analyze(self, kind, fields, samples):
+                    calls.append(kind)
+                    release.wait(timeout=10)
+                    return SchemaAnalysis(
+                        tuple(fields), (),
+                        {name: "ok" for name in fields},
+                    )
+
+            csv_path = Path(tmp) / "a.csv"
+            csv_path.write_text("id,text\n1,hello\n", encoding="utf-8")
+            json_path = Path(tmp) / "b.json"
+            json_path.write_text('{"speaker": "A"}', encoding="utf-8")
+            with patch.object(
+                MainWindow, "_create_schema_analyzer",
+                return_value=CountingSlowAnalyzer(),
+            ):
+                window.translation_page.add_file_path(csv_path)
+                self.assertIn(csv_path.resolve(), window._schema_pending)
+                # 분석 완료 전 b.json 추가 → files_changed 재발생.
+                window.translation_page.add_file_path(json_path)
+                release.set()
+            self.assertTrue(
+                self.wait_for(lambda: len(window._threads) == 0, timeout_ms=30000)
+            )
+            # worker 스레드에서 호출되므로 순서는 정렬 후 비교합니다.
+            self.assertEqual(sorted(calls), ["csv", "json"])
+
+    def test_input_autoload_analyzes_each_file_once(self) -> None:
+        # B. input 자동 로드(a.csv, b.csv, c.json)도 파일당 정확히 1회 분석합니다.
+        window = self.make_window()
+        with tempfile.TemporaryDirectory() as tmp:
+            window._schema_cache = SchemaCache(Path(tmp) / "cache.json")
+            input_dir = Path(tmp) / "input"
+            input_dir.mkdir()
+            targets = {
+                "a.csv": "id,text\n1,hello\n",
+                "b.csv": "code,body\n1,bye\n",
+                "c.json": '{"speaker": "A"}',
+            }
+            for name, content in targets.items():
+                (input_dir / name).write_text(content, encoding="utf-8")
+            calls: list[str] = []
+
+            class CountingAnalyzer:
+                def analyze(self, kind, fields, samples):
+                    calls.append(kind)
+                    return SchemaAnalysis(
+                        tuple(fields), (),
+                        {name: "ok" for name in fields},
+                    )
+
+            from script.translation.file_loader import FileLoader
+
+            with patch.object(
+                MainWindow, "_create_schema_analyzer",
+                return_value=CountingAnalyzer(),
+            ):
+                added = window._load_input_files(FileLoader(input_dir))
+            self.assertEqual(added, 3)
+            self.assertTrue(
+                self.wait_for(lambda: len(window._threads) == 0, timeout_ms=30000)
+            )
+            self.assertEqual(sorted(calls), ["csv", "csv", "json"])
+
+    def test_direct_reanalyze_call_guarded_while_pending(self) -> None:
+        # C. pending 상태에서 직접 재호출해도 analyzer는 한 번만 시작합니다.
+        # (결과가 무시되지 않도록 파일을 먼저 등록하는 실제 흐름을 사용합니다.)
+        import threading
+
+        window = self.make_window()
+        with tempfile.TemporaryDirectory() as tmp:
+            window._schema_cache = SchemaCache(Path(tmp) / "cache.json")
+            release = threading.Event()
+            calls = 0
+
+            class CountingSlowAnalyzer:
+                def analyze(self, kind, fields, samples):
+                    nonlocal calls
+                    calls += 1
+                    release.wait(timeout=10)
+                    return SchemaAnalysis(
+                        tuple(fields), (),
+                        {name: "ok" for name in fields},
+                    )
+
+            csv_path = Path(tmp) / "a.csv"
+            csv_path.write_text("id,text\n1,hello\n", encoding="utf-8")
+            analyzer = CountingSlowAnalyzer()
+            with patch.object(
+                MainWindow, "_create_schema_analyzer", return_value=analyzer
+            ):
+                window.translation_page.add_file_path(csv_path)
+                window._analyze_file_fields(csv_path.resolve())
+                window._analyze_file_fields(csv_path.resolve())
+                release.set()
+            self.assertTrue(
+                self.wait_for(lambda: len(window._threads) == 0, timeout_ms=30000)
+            )
+            self.assertEqual(calls, 1)
+            self.assertEqual(
+                window.file_field_selections.get(csv_path.resolve()), ["id", "text"]
+            )
+
+    def test_success_result_kept_despite_guard(self) -> None:
+        # D. 중복 방지 때문에 정상 성공 결과가 사라지지 않습니다.
+        window = self.make_window()
+        with tempfile.TemporaryDirectory() as tmp:
+            window._schema_cache = SchemaCache(Path(tmp) / "cache.json")
+
+            class FakeAnalyzer:
+                def analyze(self, kind, fields, samples):
+                    return SchemaAnalysis(
+                        ("text",), ("id",),
+                        {"text": "대사", "id": "코드"},
+                    )
+
+            csv_path = Path(tmp) / "a.csv"
+            csv_path.write_text("id,text\n1,hello\n", encoding="utf-8")
+            with patch.object(
+                MainWindow, "_create_schema_analyzer", return_value=FakeAnalyzer()
+            ):
+                window.translation_page.add_file_path(csv_path)
+            self.assertTrue(
+                self.wait_for(
+                    lambda: window.file_field_selections.get(csv_path.resolve())
+                    == ["text"]
+                )
+            )
+            # 결과가 있는데 다시 files_changed가 와도 유지됩니다.
+            window._on_files_changed(window.translation_page.selected_paths())
+            self.assertEqual(
+                window.file_field_selections.get(csv_path.resolve()), ["text"]
+            )
+
 
 @unittest.skipUnless(PYSIDE_AVAILABLE, "PySide6이 필요합니다.")
 class PromptLanguageTest(unittest.TestCase):

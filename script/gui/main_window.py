@@ -522,7 +522,10 @@ class MainWindow(QMainWindow):
             self.translation_page.set_analysis_status("")
             return
         for path in structured:
-            if path not in self.file_field_selections:
+            if (
+                path not in self.file_field_selections
+                and path not in self._schema_pending
+            ):
                 self._analyze_file_fields(path)
         self._show_displayed_fields()
 
@@ -570,7 +573,14 @@ class MainWindow(QMainWindow):
         → Gemini 백그라운드 분석(pending)
         → Gemini 사용 불가(미선택 + 직접 선택 안내).
         분석 실패 시도 미선택을 유지하고 전체 fallback을 하지 않습니다.
+
+        이미 분석 중이거나 결과가 있으면 다시 시작하지 않습니다.
+        (자동 분석 경로 전용 중복 방지이며, 명시적 재분석을 막지 않습니다.)
         """
+        if path in self._schema_pending:
+            return
+        if path in self.file_field_selections:
+            return
         try:
             handler = create_handler(path)
             handler.load(path)
