@@ -6,12 +6,42 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QListWidget,
+    QListWidgetItem,
     QPushButton,
     QScrollArea,
     QTextEdit,
     QVBoxLayout,
     QWidget,
 )
+
+
+class ChatInput(QTextEdit):
+    """Enter 전송 / Shift+Enter 줄바꿈 입력창입니다."""
+
+    send_pressed = Signal()
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self._composing = False
+
+    def inputMethodEvent(self, event) -> None:  # noqa: N802 (Qt override)
+        # 한글 IME 조합 중 Enter는 조합 확정에 쓰이므로 전송하지 않습니다.
+        try:
+            self._composing = bool(event.preeditString())
+        except Exception:
+            self._composing = False
+        super().inputMethodEvent(event)
+
+    def keyPressEvent(self, event) -> None:  # noqa: N802 (Qt override)
+        if event.key() in (Qt.Key_Return, Qt.Key_Enter) and not self._composing:
+            if event.modifiers() & Qt.ShiftModifier:
+                super().keyPressEvent(event)
+                return
+            event.accept()
+            if self.toPlainText().strip():
+                self.send_pressed.emit()
+            return
+        super().keyPressEvent(event)
 
 
 class ChatPage(QWidget):
@@ -21,6 +51,7 @@ class ChatPage(QWidget):
     new_chat_requested = Signal()
     clear_requested = Signal()
     export_requested = Signal()
+    conversation_selected = Signal(str)  # session id (Qt.UserRole 기반)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -56,6 +87,7 @@ class ChatPage(QWidget):
 
         self.history_list = QListWidget()
         self.history_list.setStyleSheet("QListWidget { border: none; }")
+        self.history_list.itemClicked.connect(self._on_history_clicked)
         layout.addWidget(self.history_list, 1)
         self.empty_history_label = QLabel("저장된 대화가 없습니다.")
         self.empty_history_label.setObjectName("TinyMuted")
@@ -105,7 +137,6 @@ class ChatPage(QWidget):
         export_btn.clicked.connect(self.export_requested.emit)
         clear_btn = QPushButton("🗑  지우기")
         clear_btn.setObjectName("SecondaryButton")
-        clear_btn.clicked.connect(self.clear_messages)
         clear_btn.clicked.connect(self.clear_requested.emit)
         header.addWidget(export_btn)
         header.addWidget(clear_btn)
@@ -130,10 +161,11 @@ class ChatPage(QWidget):
         composer = QFrame()
         composer.setObjectName("Card")
         composer_layout = QVBoxLayout(composer)
-        self.input = QTextEdit()
+        self.input = ChatInput()
         self.input.setPlaceholderText("번역할 문장이나 궁금한 점을 입력하세요…")
         self.input.setFixedHeight(64)
         self.input.setStyleSheet("QTextEdit { border: none; }")
+        self.input.send_pressed.connect(self._emit_send)
         composer_layout.addWidget(self.input)
         bottom = QHBoxLayout()
         attach = QPushButton("📎  파일 첨부")
@@ -256,6 +288,30 @@ class ChatPage(QWidget):
         has_message = self.message_count() > 0
         self.empty_chat_label.setVisible(not has_message)
         self.empty_history_label.setVisible(self.history_list.count() == 0)
+
+    # ---------- 최근 대화 목록 (표시 전용, id는 Qt.UserRole) ----------
+    def _on_history_clicked(self, item: QListWidgetItem) -> None:
+        session_id = item.data(Qt.UserRole)
+        if isinstance(session_id, str) and session_id:
+            self.conversation_selected.emit(session_id)
+
+    def set_conversations(self, sessions: list[dict], current_id: str | None = None) -> None:
+        """session 요약 목록을 다시 그립니다. 동일 제목도 id로 구분됩니다."""
+        self.history_list.blockSignals(True)
+        try:
+            self.history_list.clear()
+            for session in sessions:
+                item = QListWidgetItem(str(session.get("title", "새 대화")))
+                item.setData(Qt.UserRole, str(session.get("id", "")))
+                self.history_list.addItem(item)
+                if current_id is not None and session.get("id") == current_id:
+                    self.history_list.setCurrentItem(item)
+        finally:
+            self.history_list.blockSignals(False)
+        self._refresh_empty_state()
+
+    def set_conversation_title(self, title: str) -> None:
+        self.title_label.setText(title)
 
     def _emit_send(self) -> None:
         text = self.input.toPlainText().strip()

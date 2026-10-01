@@ -75,12 +75,16 @@ class PromptListCard(QFrame):
 class PromptPage(QWidget):
     """좌측 Prompt 목록 + 우측 Prompt Editor 화면입니다."""
 
+    ai_generate_requested = Signal()
+
     def __init__(self, manager: PromptManager | None = None, parent=None) -> None:
         super().__init__(parent)
         self.manager = manager or PromptManager()
         self.presets: list[PromptPreset] = []
         self.current: PromptPreset | None = None
         self.is_new = False
+        # AI 초안 기반 저장이면 True. Manual 직접 작성과 구분합니다.
+        self.ai_draft = False
         self._cards: list[PromptListCard] = []
 
         root = QVBoxLayout(self)
@@ -199,6 +203,7 @@ class PromptPage(QWidget):
         top.addLayout(title_col, 1)
         self.ai_button = QPushButton("✦ AI로 Prompt 생성")
         self.ai_button.setObjectName("SecondaryButton")
+        self.ai_button.clicked.connect(self.ai_generate_requested.emit)
         self.edit_button = QPushButton("✎ 수정")
         self.edit_button.setObjectName("PrimaryButton")
         self.delete_button = QPushButton("🗑 삭제")
@@ -378,6 +383,7 @@ class PromptPage(QWidget):
     def select_preset(self, preset: PromptPreset) -> None:
         self.current = preset
         self.is_new = False
+        self.ai_draft = False
         self.title_label.setText(preset.name)
         self.subtitle_label.setText(
             f"{preset.source_language}  →  {preset.target_language} / {preset.document_type}"
@@ -397,6 +403,7 @@ class PromptPage(QWidget):
     def new_prompt(self) -> None:
         self.current = None
         self.is_new = True
+        self.ai_draft = False
         self.title_label.setText("새 Prompt")
         self.subtitle_label.setText("-")
         self.source_combo.setCurrentText("Japanese")
@@ -433,7 +440,8 @@ class PromptPage(QWidget):
             return
         try:
             if self.is_new or self.current is None:
-                preset = self.manager.create_preset(name, source, target, doc_type, prompt, "Manual")
+                created_by = "AI" if self.ai_draft else "Manual"
+                preset = self.manager.create_preset(name, source, target, doc_type, prompt, created_by)
                 self.manager.save(preset, overwrite=False)
             else:
                 updated, _ = self.manager.update(
@@ -446,6 +454,7 @@ class PromptPage(QWidget):
                 )
                 self.current = updated
                 self.is_new = False
+            self.ai_draft = False
             self.set_validation(True, "✔  저장했습니다.")
         except ChatbotError as error:
             self.set_validation(False, f"저장 실패: {error}")
@@ -565,3 +574,28 @@ class PromptPage(QWidget):
 
     def editor_text(self) -> str:
         return self.editor.toPlainText()
+
+    def apply_ai_draft(
+        self, draft: str, source: str, target: str, document_type: str
+    ) -> None:
+        """AI 생성 draft를 editor에 삽입합니다. 자동 저장하지 않습니다."""
+        self.current = None
+        self.is_new = True
+        self.ai_draft = True
+        self.title_label.setText("새 Prompt (AI 초안)")
+        self.subtitle_label.setText("-")
+        self._set_combo_text(self.source_combo, source)
+        self._set_combo_text(self.target_combo, target)
+        self.doc_edit.setText(document_type)
+        self.editor.setPlainText(draft)
+        self.meta_usage.setText("-")
+        self.meta_version.setText("-")
+        self.meta_last.setText("-")
+        self.meta_created_by.setText("AI")
+        self.set_validation(True, "AI Prompt를 생성했습니다. 확인 후 저장해주세요.")
+        self._set_editor_enabled(True)
+
+    def set_generating(self, busy: bool) -> None:
+        """AI 생성 중 버튼 상태를 표시합니다."""
+        self.ai_button.setEnabled(not busy)
+        self.ai_button.setText("AI Prompt 생성 중..." if busy else "✦ AI로 Prompt 생성")

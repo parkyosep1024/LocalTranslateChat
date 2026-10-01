@@ -18,5 +18,22 @@ class ConversationHistory:
     def clear(self) -> None:
         self._messages.clear()
 
+    def replace_messages(self, messages: list[dict[str, str]]) -> None:
+        """저장된 대화를 복원할 때 전체 기록을 교체합니다.
+
+        user/assistant 역할과 문자열 content만 허용하고,
+        그 외 형식은 ValueError로 거부합니다.
+        """
+        replaced: list[dict[str, str]] = []
+        for message in messages:
+            if (
+                not isinstance(message, dict)
+                or message.get("role") not in {"user", "assistant"}
+                or not isinstance(message.get("content"), str)
+            ):
+                raise ValueError("복원할 수 없는 메시지 형식입니다.")
+            replaced.append({"role": message["role"], "content": message["content"]})
+        self._messages = replaced
+
     def __len__(self) -> int:
         return len(self._messages)

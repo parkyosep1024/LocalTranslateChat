@@ -41,11 +41,6 @@ class Sidebar(QWidget):
 
         root.addStretch(1)
 
-        settings = QPushButton("⚙  환경설정")
-        settings.setObjectName("SidebarButton")
-        root.addWidget(settings)
-        self.btn_settings = settings
-
         self.model_status = QLabel("● 로컬 모델 연결됨")
         self.model_status.setObjectName("BadgeGreen")
         root.addWidget(self.model_status)

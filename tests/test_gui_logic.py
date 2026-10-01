@@ -9,7 +9,8 @@ from unittest.mock import patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 try:
-    from PySide6.QtCore import QEventLoop, QThread, QTimer
+    from PySide6.QtCore import QEvent, QEventLoop, Qt, QThread, QTimer
+    from PySide6.QtGui import QInputMethodEvent, QKeyEvent
     from PySide6.QtWidgets import QApplication
 
     from script.config.translation_settings import TranslationSettings
@@ -462,6 +463,7 @@ class MainWindowLifecycleTest(unittest.TestCase):
     def test_ollama_status_states_update_ui(self) -> None:
         # 스레드 없이 3가지 상태 판정이 UI에 반영되는지 직접 검증합니다.
         window = self.make_window()
+        window._gemini_available = False
         window._on_ollama_status({"connected": True, "model_found": True})
         self.assertIn("로컬 모델 연결됨", window.sidebar.model_status.text())
         self.assertIn("엔진 준비됨", window.translation_page.engine_badge.text())
@@ -470,6 +472,10 @@ class MainWindowLifecycleTest(unittest.TestCase):
         self.assertIn("모델 없음", window.translation_page.engine_badge.text())
         window._on_ollama_status({"connected": False, "model_found": False})
         self.assertIn("연결 안 됨", window.sidebar.model_status.text())
+        # Gemini 사용 가능 시에는 오해 없는 문구를 표시합니다.
+        window._gemini_available = True
+        window._on_ollama_status({"connected": False, "model_found": False})
+        self.assertIn("API 번역 가능", window.sidebar.model_status.text())
 
     def test_ollama_checking_blocks_translation_start(self) -> None:
         # BUG4: _ollama_connected is None(확인 중)이면 시작하지 않습니다.
@@ -1227,6 +1233,721 @@ class SchemaWorkerTest(unittest.TestCase):
         worker.run()
         self.assertEqual(done, [])
         self.assertEqual(errors, [("k", "bad json")])
+
+
+@unittest.skipUnless(PYSIDE_AVAILABLE, "PySide6이 필요합니다.")
+class _WindowTestBase(unittest.TestCase):
+    """MainWindow 기반 테스트 공용 fixture입니다."""
+
+    def setUp(self) -> None:
+        _app()
+        self.windows: list = []
+        self._status_patch = patch(
+            "script.gui.workers.fetch_ollama_status",
+            return_value={"connected": False, "model_found": False},
+        )
+        self._status_patch.start()
+
+    def tearDown(self) -> None:
+        for window in self.windows:
+            try:
+                self.wait_for(
+                    lambda w=window: w._ollama_connected is not None,
+                    timeout_ms=10000,
+                )
+                self.wait_for(
+                    lambda w=window: len(w._threads) == 0,
+                    timeout_ms=30000,
+                )
+                window.close()
+            except Exception:
+                pass
+        try:
+            self._status_patch.stop()
+        except Exception:
+            pass
+        _app().processEvents()
+
+    def make_window(self, analyzer=None):
+        with patch.object(MainWindow, "_create_schema_analyzer", return_value=analyzer):
+            window = MainWindow()
+        self.windows.append(window)
+        window.translation_page.clear_files()
+        window.file_field_selections.clear()
+        window._file_field_info.clear()
+        window._displayed_schema_file = None
+        window.translation_page.set_analysis_status("")
+        return window
+
+    def wait_for(self, condition, timeout_ms: int = 3000) -> bool:
+        if condition():
+            return True
+        loop = QEventLoop()
+        poll = QTimer()
+        poll.setInterval(10)
+        timeout = QTimer()
+        timeout.setSingleShot(True)
+
+        def check() -> None:
+            if condition():
+                loop.quit()
+
+        poll.timeout.connect(check)
+        timeout.timeout.connect(loop.quit)
+        poll.start()
+        timeout.start(timeout_ms)
+        loop.exec()
+        poll.stop()
+        timeout.stop()
+        return condition()
+
+    def use_tmp_store(self, window, tmp: str):
+        from script.chat.session_store import ChatSessionStore
+
+        window.session_store = ChatSessionStore(Path(tmp) / "chat_history.json")
+        return window.session_store
+
+
+class _FakeChatEngine:
+    """성공 시에만 history를 남기는 ChatEngine 대역입니다."""
+
+    def __init__(self, answers=("ans",), fail: bool = False) -> None:
+        from script.chat.history import ConversationHistory
+
+        self.history = ConversationHistory()
+        self._answers = list(answers)
+        self._fail = fail
+
+    def chat(self, message: str) -> str:
+        if self._fail:
+            raise RuntimeError("boom")
+        answer = self._answers.pop(0) if self._answers else "ans"
+        self.history.add_user_message(message)
+        self.history.add_assistant_message(answer)
+        return answer
+
+    def clear_history(self) -> None:
+        self.history.clear()
+
+
+@unittest.skipUnless(PYSIDE_AVAILABLE, "PySide6이 필요합니다.")
+class ChatInputTest(unittest.TestCase):
+    def test_enter_sends_once_without_newline(self) -> None:
+        _app()
+        from script.gui.pages.chat_page import ChatInput
+
+        sent: list = []
+        box = ChatInput()
+        box.send_pressed.connect(lambda: sent.append(True))
+        box.setPlainText("hi")
+        box.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, Qt.Key_Return, Qt.NoModifier))
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(box.toPlainText(), "hi")
+
+    def test_numpad_enter_sends(self) -> None:
+        _app()
+        from script.gui.pages.chat_page import ChatInput
+
+        sent: list = []
+        box = ChatInput()
+        box.send_pressed.connect(lambda: sent.append(True))
+        box.setPlainText("hi")
+        box.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, Qt.Key_Enter, Qt.NoModifier))
+        self.assertEqual(len(sent), 1)
+
+    def test_shift_enter_inserts_newline_without_send(self) -> None:
+        _app()
+        from script.gui.pages.chat_page import ChatInput
+
+        sent: list = []
+        box = ChatInput()
+        box.send_pressed.connect(lambda: sent.append(True))
+        box.setPlainText("hi")
+        from PySide6.QtGui import QTextCursor
+
+        box.moveCursor(QTextCursor.MoveOperation.End)
+        box.keyPressEvent(
+            QKeyEvent(QEvent.Type.KeyPress, Qt.Key_Return, Qt.ShiftModifier)
+        )
+        self.assertEqual(sent, [])
+        self.assertIn("\n", box.toPlainText())
+
+    def test_ime_composing_enter_does_not_send(self) -> None:
+        _app()
+        from script.gui.pages.chat_page import ChatInput
+
+        sent: list = []
+        box = ChatInput()
+        box.send_pressed.connect(lambda: sent.append(True))
+        box.inputMethodEvent(QInputMethodEvent("한", []))
+        box.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, Qt.Key_Return, Qt.NoModifier))
+        self.assertEqual(sent, [])
+        # 조합 확정 후에는 정상 전송됩니다.
+        box.inputMethodEvent(QInputMethodEvent("", []))
+        box.setPlainText("한")
+        box.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, Qt.Key_Return, Qt.NoModifier))
+        self.assertEqual(len(sent), 1)
+
+    def test_page_empty_input_does_not_send(self) -> None:
+        _app()
+        page = ChatPage()
+        sent: list = []
+        page.send_requested.connect(sent.append)
+        page.input.setPlainText("   ")
+        page._emit_send()
+        self.assertEqual(sent, [])
+
+    def test_page_send_button_sends(self) -> None:
+        _app()
+        page = ChatPage()
+        sent: list = []
+        page.send_requested.connect(sent.append)
+        page.input.setPlainText("hello")
+        page.send_button.click()
+        self.assertEqual(sent, ["hello"])
+
+    def test_sending_disables_input(self) -> None:
+        _app()
+        page = ChatPage()
+        page.set_sending(True)
+        self.assertTrue(page.input.isReadOnly())
+        self.assertFalse(page.send_button.isEnabled())
+        page.set_sending(False)
+        self.assertFalse(page.input.isReadOnly())
+        self.assertTrue(page.send_button.isEnabled())
+
+
+@unittest.skipUnless(PYSIDE_AVAILABLE, "PySide6이 필요합니다.")
+class ChatSessionGuiTest(_WindowTestBase):
+    def test_first_success_saves_session(self) -> None:
+        window = self.make_window()
+        with tempfile.TemporaryDirectory() as tmp:
+            self.use_tmp_store(window, tmp)
+            window.chat_engine = _FakeChatEngine(("hello",))
+            window.chat_page.input.setPlainText("hi")
+            window.chat_page._emit_send()
+            self.assertTrue(
+                self.wait_for(lambda: window.chat_page.message_count() == 2)
+            )
+            sessions = window.session_store.list_sessions()
+            self.assertEqual(len(sessions), 1)
+            self.assertEqual(sessions[0]["title"], "hi")
+            self.assertIsNotNone(window._current_session_id)
+
+    def test_new_chat_keeps_old_session(self) -> None:
+        window = self.make_window()
+        with tempfile.TemporaryDirectory() as tmp:
+            self.use_tmp_store(window, tmp)
+            window.chat_engine = _FakeChatEngine(("hello",))
+            window.chat_page.input.setPlainText("hi")
+            window.chat_page._emit_send()
+            self.assertTrue(
+                self.wait_for(lambda: window.chat_page.message_count() == 2)
+            )
+            window._on_new_chat()
+            self.assertEqual(window.chat_page.message_count(), 0)
+            self.assertIsNone(window._current_session_id)
+            self.assertEqual(len(window.session_store.list_sessions()), 1)
+
+    def test_select_restores_messages_and_engine(self) -> None:
+        window = self.make_window()
+        with tempfile.TemporaryDirectory() as tmp:
+            self.use_tmp_store(window, tmp)
+            window.chat_engine = _FakeChatEngine(("hello",))
+            window.chat_page.input.setPlainText("hi")
+            window.chat_page._emit_send()
+            self.assertTrue(
+                self.wait_for(lambda: window.chat_page.message_count() == 2)
+            )
+            session_id = window._current_session_id
+            assert session_id is not None
+            window._on_new_chat()
+            item = window.chat_page.history_list.item(0)
+            window.chat_page.history_list.itemClicked.emit(item)
+            self.assertEqual(window.chat_page.message_count(), 2)
+            self.assertEqual(len(window.chat_engine.history.get_messages()), 2)
+            self.assertEqual(window._current_session_id, session_id)
+
+    def test_reload_store_loads_sessions(self) -> None:
+        window = self.make_window()
+        with tempfile.TemporaryDirectory() as tmp:
+            self.use_tmp_store(window, tmp)
+            window.chat_engine = _FakeChatEngine(("hello",))
+            window.chat_page.input.setPlainText("hi")
+            window.chat_page._emit_send()
+            self.assertTrue(
+                self.wait_for(lambda: window.chat_page.message_count() == 2)
+            )
+            from script.chat.session_store import ChatSessionStore
+
+            reloaded = ChatSessionStore(Path(tmp) / "chat_history.json")
+            self.assertEqual(len(reloaded.list_sessions()), 1)
+
+    def test_delete_saved_conversation(self) -> None:
+        window = self.make_window()
+        with tempfile.TemporaryDirectory() as tmp:
+            self.use_tmp_store(window, tmp)
+            window.chat_engine = _FakeChatEngine(("hello",))
+            window.chat_page.input.setPlainText("hi")
+            window.chat_page._emit_send()
+            self.assertTrue(
+                self.wait_for(lambda: window.chat_page.message_count() == 2)
+            )
+            with patch("script.gui.main_window.QMessageBox") as box:
+                box.question.return_value = box.Yes
+                window._on_chat_clear_requested()
+            self.assertEqual(window.session_store.list_sessions(), [])
+            self.assertEqual(window.chat_page.message_count(), 0)
+            self.assertEqual(window.chat_engine.history.get_messages(), [])
+
+    def test_delete_cancelled_changes_nothing(self) -> None:
+        window = self.make_window()
+        with tempfile.TemporaryDirectory() as tmp:
+            self.use_tmp_store(window, tmp)
+            window.chat_engine = _FakeChatEngine(("hello",))
+            window.chat_page.input.setPlainText("hi")
+            window.chat_page._emit_send()
+            self.assertTrue(
+                self.wait_for(lambda: window.chat_page.message_count() == 2)
+            )
+            with patch("script.gui.main_window.QMessageBox") as box:
+                box.question.return_value = box.No
+                window._on_chat_clear_requested()
+            self.assertEqual(len(window.session_store.list_sessions()), 1)
+            self.assertEqual(window.chat_page.message_count(), 2)
+
+    def test_failed_request_not_saved_as_pair(self) -> None:
+        window = self.make_window()
+        with tempfile.TemporaryDirectory() as tmp:
+            self.use_tmp_store(window, tmp)
+            window.chat_engine = _FakeChatEngine(fail=True)
+            window.chat_page.input.setPlainText("hi")
+            window.chat_page._emit_send()
+            self.assertTrue(
+                self.wait_for(lambda: window.chat_page.message_count() == 2)
+            )
+            self.assertEqual(window.session_store.list_sessions(), [])
+            self.assertEqual(window.chat_engine.history.get_messages(), [])
+
+    def test_export_empty_blocked(self) -> None:
+        window = self.make_window()
+        with tempfile.TemporaryDirectory() as tmp:
+            self.use_tmp_store(window, tmp)
+            window.chat_engine = _FakeChatEngine(())
+            with patch(
+                "script.gui.main_window.QFileDialog"
+            ) as dialog:
+                dialog.getSaveFileName.side_effect = AssertionError("호출 금지")
+                window._on_chat_export()
+            self.assertEqual(window.chat_page.message_count(), 1)  # 안내 bubble만
+
+    def test_export_writes_readable_txt(self) -> None:
+        window = self.make_window()
+        with tempfile.TemporaryDirectory() as tmp:
+            self.use_tmp_store(window, tmp)
+            window.chat_engine = _FakeChatEngine(("안녕 나야",))
+            window.chat_page.input.setPlainText("TCP가 뭐야?")
+            window.chat_page._emit_send()
+            self.assertTrue(
+                self.wait_for(lambda: window.chat_page.message_count() == 2)
+            )
+            target = str(Path(tmp) / "chat.txt")
+            with patch("script.gui.main_window.QFileDialog") as dialog:
+                dialog.getSaveFileName.return_value = (target, "Text (*.txt)")
+                window._on_chat_export()
+            content = Path(target).read_text(encoding="utf-8")
+            self.assertIn("제목: TCP가 뭐야?", content)
+            self.assertIn("[사용자]", content)
+            self.assertIn("TCP가 뭐야?", content)
+            self.assertIn("[AI]", content)
+            self.assertIn("안녕 나야", content)
+
+    def test_export_cancelled_creates_nothing(self) -> None:
+        window = self.make_window()
+        with tempfile.TemporaryDirectory() as tmp:
+            self.use_tmp_store(window, tmp)
+            window.chat_engine = _FakeChatEngine(("a",))
+            window.chat_page.input.setPlainText("q")
+            window.chat_page._emit_send()
+            self.assertTrue(
+                self.wait_for(lambda: window.chat_page.message_count() == 2)
+            )
+            target = str(Path(tmp) / "chat.txt")
+            with patch("script.gui.main_window.QFileDialog") as dialog:
+                dialog.getSaveFileName.return_value = ("", "")
+                window._on_chat_export()
+            self.assertFalse(Path(target).exists())
+
+    def test_export_write_failure_is_safe(self) -> None:
+        window = self.make_window()
+        with tempfile.TemporaryDirectory() as tmp:
+            self.use_tmp_store(window, tmp)
+            window.chat_engine = _FakeChatEngine(("a",))
+            window.chat_page.input.setPlainText("q")
+            window.chat_page._emit_send()
+            self.assertTrue(
+                self.wait_for(lambda: window.chat_page.message_count() == 2)
+            )
+            before = window.chat_page.message_count()
+            with patch("script.gui.main_window.QFileDialog") as dialog:
+                dialog.getSaveFileName.return_value = (tmp, "Text (*.txt)")
+                window._on_chat_export()  # 디렉터리에 쓰기 → OSError
+            self.assertEqual(window.chat_page.message_count(), before + 1)
+
+
+@unittest.skipUnless(PYSIDE_AVAILABLE, "PySide6이 필요합니다.")
+class TranslationFallbackTest(_WindowTestBase):
+    def test_local_engine_selected_when_ready(self) -> None:
+        from script.providers.local_llm import LocalLLM
+
+        window = self.make_window()
+        settings = TranslationSettings(model="m")
+        llm = window._create_translation_llm(settings, use_api=False)
+        self.assertIsInstance(llm, LocalLLM)
+
+    def test_api_provider_message_shape(self) -> None:
+        from script.providers.gemini_translation import GeminiTranslationProvider
+
+        received: list = []
+
+        class FakeClient:
+            def create_chat_completion(self, messages):
+                received.extend(messages)
+                return "TRANSLATED"
+
+        provider = GeminiTranslationProvider(FakeClient())
+        self.assertEqual(provider.generate("hello"), "TRANSLATED")
+        roles = [m["role"] for m in received]
+        self.assertIn("system", roles)
+        self.assertIn("hello", [m["content"] for m in received if m["role"] == "user"])
+
+    def test_fallback_cancelled_starts_nothing(self) -> None:
+        window = self.make_window()
+        window.translation_settings = TranslationSettings(model="test-model")
+        window._ollama_connected = False
+        window._gemini_available = True
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "a.txt"
+            target.write_text("hello", encoding="utf-8")
+            window.translation_page.add_file_path(target)
+            with patch.object(
+                MainWindow, "_confirm_api_fallback", return_value=False
+            ):
+                window._on_translation_start()
+            self.assertIsNone(window._translation_worker)
+            self.assertNotEqual(window.translation_page._state, "running")
+
+    def test_no_gemini_blocks_api_translation(self) -> None:
+        window = self.make_window()
+        window.translation_settings = TranslationSettings(model="test-model")
+        window._ollama_connected = False
+        window._gemini_available = False
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "a.txt"
+            target.write_text("hello", encoding="utf-8")
+            window.translation_page.add_file_path(target)
+            window._on_translation_start()
+            self.assertIn("설정이 없어", window.translation_page.status_label.text())
+            self.assertIsNone(window._translation_worker)
+
+    def _echo_llm(self):
+        class EchoLLM:
+            def generate(self, prompt: str) -> str:
+                marker = "[원문]\n"
+                body = prompt.split(marker, 1)[1] if marker in prompt else prompt
+                return "ECHO:" + body
+
+        return EchoLLM()
+
+    def _run_api_translation(self, window, tmp: str, files: dict) -> Path:
+        out_dir = Path(tmp) / "out"
+        window.translation_settings = TranslationSettings(
+            model="test-model", input_dir=Path(tmp), output_dir=out_dir
+        )
+        window._ollama_connected = False
+        window._gemini_available = True
+        with patch.object(MainWindow, "_create_schema_analyzer", return_value=None):
+            for name, content in files.items():
+                path = Path(tmp) / name
+                path.write_text(content, encoding="utf-8")
+                window.translation_page.add_file_path(path)
+        for check in window.translation_page.field_checks:
+            check.setChecked(check.text() in {"text", "dialogue", "body"})
+        with patch.object(MainWindow, "_confirm_api_fallback", return_value=True), \
+            patch.object(window, "_create_translation_llm", return_value=self._echo_llm()):
+            window._on_translation_start()
+        self.assertTrue(
+            self.wait_for(
+                lambda: window.translation_page._state in {"done", "stopped"},
+                timeout_ms=30000,
+            )
+        )
+        return out_dir
+
+    def test_api_fallback_txt_with_placeholder(self) -> None:
+        window = self.make_window()
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = self._run_api_translation(
+                window, tmp, {"a.txt": "hello {player_name} %s"}
+            )
+            content = (out_dir / "a.txt").read_text(encoding="utf-8")
+            self.assertIn("{player_name}", content)
+            self.assertIn("%s", content)
+
+    def test_api_fallback_csv_selected_only(self) -> None:
+        window = self.make_window()
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = self._run_api_translation(
+                window, tmp, {"a.csv": "id,text\n1,hi {player_name}\n"}
+            )
+            import csv as csv_module
+
+            with (out_dir / "a.csv").open(encoding="utf-8") as stream:
+                rows = list(csv_module.DictReader(stream))
+            self.assertEqual(rows[0]["id"], "1")
+            self.assertIn("{player_name}", rows[0]["text"])
+
+    def test_api_fallback_json_selected_only(self) -> None:
+        import json as json_module
+
+        window = self.make_window()
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = self._run_api_translation(
+                window, tmp, {"a.json": '{"voice": "f.wav", "dialogue": "hi ${v}}"}'}
+            )
+            data = json_module.loads((out_dir / "a.json").read_text(encoding="utf-8"))
+            self.assertEqual(data["voice"], "f.wav")
+            self.assertIn("${v}", data["dialogue"])
+
+    def test_no_midrun_auto_fallback(self) -> None:
+        from script.translation.file_loader import FileLoader
+        from script.translation.file_writer import FileWriter
+        from script.translation.translator import Translator
+
+        class FailingLLM:
+            def generate(self, prompt: str) -> str:
+                raise RuntimeError("ollama down")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "a.txt"
+            src.write_text("hello", encoding="utf-8")
+            settings = TranslationSettings(
+                model="m", input_dir=Path(tmp), output_dir=Path(tmp) / "out"
+            )
+            translator = Translator(
+                loader=FileLoader(settings.input_dir),
+                local_llm=FailingLLM(),
+                writer=FileWriter(settings.output_dir),
+                file_paths=[src],
+            )
+            summary = translator.translate_all(output_func=lambda _m: None)
+            self.assertEqual(summary.failed, 1)
+
+
+@unittest.skipUnless(PYSIDE_AVAILABLE, "PySide6이 필요합니다.")
+class PromptPageGenerateTest(_WindowTestBase):
+    def test_ai_button_emits_signal(self) -> None:
+        _app()
+        with tempfile.TemporaryDirectory() as tmp:
+            page = PromptPage(manager=PromptManager(presets_dir=Path(tmp)))
+            fired: list = []
+            page.ai_generate_requested.connect(lambda: fired.append(True))
+            page.ai_button.click()
+            self.assertEqual(fired, [True])
+
+    def test_empty_doctype_blocks_call(self) -> None:
+        window = self.make_window()
+        window.prompt_page.doc_edit.clear()
+        window._on_prompt_page_generate()
+        self.assertIsNone(window._prompt_worker)
+        self.assertIn("문서 유형", window.prompt_page.validation_label.text())
+
+    def test_success_inserts_draft_without_save(self) -> None:
+        window = self.make_window()
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "a.txt"
+            target.write_text("hello world, hello again", encoding="utf-8")
+            window.translation_page.add_file_path(target)
+
+            class FakeBuilder:
+                def create_draft(self, files, source, target, doc, sample_text=None):
+                    assert sample_text and "hello" in sample_text
+                    return "DRAFT-BODY"
+
+            window.prompt_page.doc_edit.setText("game_dialogue")
+            with patch("script.gui.main_window.QInputDialog") as dialog, \
+                patch("script.gui.main_window.Settings") as settings_cls, \
+                patch("script.gui.main_window.PromptBuilder", return_value=FakeBuilder()):
+                dialog.getText.return_value = ("game_dialogue", True)
+                settings_cls.from_env.return_value.validate.return_value = None
+                window._on_prompt_page_generate()
+                self.assertTrue(
+                    self.wait_for(lambda: "DRAFT-BODY" in window.prompt_page.editor_text())
+                )
+            self.assertIn("DRAFT-BODY", window.prompt_page.editor_text())
+            self.assertTrue(window.prompt_page.ai_draft)
+            self.assertTrue(window.prompt_page.ai_button.isEnabled())
+
+    def test_no_files_uses_dialog_sample(self) -> None:
+        window = self.make_window()
+        window.translation_page.clear_files()
+        window.file_field_selections.clear()
+        with tempfile.TemporaryDirectory() as tmp:
+            sample = Path(tmp) / "s.txt"
+            sample.write_text("sample text here", encoding="utf-8")
+
+            class FakeBuilder:
+                def create_draft(self, files, source, target, doc, sample_text=None):
+                    assert sample_text and "sample text" in sample_text
+                    return "DRAFT2"
+
+            window.prompt_page.doc_edit.setText("novel")
+            with patch("script.gui.main_window.QFileDialog") as filedialog, \
+                patch("script.gui.main_window.QInputDialog") as dialog, \
+                patch("script.gui.main_window.Settings") as settings_cls, \
+                patch("script.gui.main_window.PromptBuilder", return_value=FakeBuilder()):
+                filedialog.getOpenFileName.return_value = (str(sample), "")
+                dialog.getText.return_value = ("novel", True)
+                settings_cls.from_env.return_value.validate.return_value = None
+                window._on_prompt_page_generate()
+                self.assertTrue(
+                    self.wait_for(lambda: "DRAFT2" in window.prompt_page.editor_text())
+                )
+            self.assertEqual(window.translation_page.selected_paths(), [])
+
+    def test_failure_keeps_editor(self) -> None:
+        window = self.make_window()
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "a.txt"
+            target.write_text("hello hello hello", encoding="utf-8")
+            window.translation_page.add_file_path(target)
+            window.prompt_page.set_editor_text("기존 내용 유지")
+
+            class FailingBuilder:
+                def create_draft(self, *args, **kwargs):
+                    raise RuntimeError("gemini down")
+
+            window.prompt_page.doc_edit.setText("game_dialogue")
+            with patch("script.gui.main_window.QInputDialog") as dialog, \
+                patch("script.gui.main_window.Settings") as settings_cls, \
+                patch("script.gui.main_window.PromptBuilder", return_value=FailingBuilder()):
+                dialog.getText.return_value = ("game_dialogue", True)
+                settings_cls.from_env.return_value.validate.return_value = None
+                window._on_prompt_page_generate()
+                self.assertTrue(
+                    self.wait_for(
+                        lambda: "실패" in window.prompt_page.validation_label.text()
+                    )
+                )
+            self.assertEqual(window.prompt_page.editor_text(), "기존 내용 유지")
+            self.assertTrue(window.prompt_page.ai_button.isEnabled())
+
+    def test_busy_disables_button(self) -> None:
+        import threading
+
+        window = self.make_window()
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "a.txt"
+            target.write_text("hello hello hello", encoding="utf-8")
+            window.translation_page.add_file_path(target)
+            release = threading.Event()
+
+            class SlowBuilder:
+                def create_draft(self, *args, **kwargs):
+                    release.wait(timeout=10)
+                    return "SLOW"
+
+            window.prompt_page.doc_edit.setText("game_dialogue")
+            with patch("script.gui.main_window.QInputDialog") as dialog, \
+                patch("script.gui.main_window.Settings") as settings_cls, \
+                patch("script.gui.main_window.PromptBuilder", return_value=SlowBuilder()):
+                dialog.getText.return_value = ("game_dialogue", True)
+                settings_cls.from_env.return_value.validate.return_value = None
+                window._on_prompt_page_generate()
+                self.assertFalse(window.prompt_page.ai_button.isEnabled())
+                release.set()
+                self.assertTrue(
+                    self.wait_for(lambda: "SLOW" in window.prompt_page.editor_text())
+                )
+            self.assertTrue(window.prompt_page.ai_button.isEnabled())
+
+    def test_ai_draft_save_marks_ai(self) -> None:
+        _app()
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = PromptManager(presets_dir=Path(tmp))
+            page = PromptPage(manager=manager)
+            page.apply_ai_draft("draft body", "Japanese", "Korean", "game_dialogue")
+            with patch.object(page, "_ask_text", return_value=("n1", True)):
+                page.save_current()
+            saved = manager.find_by_name("n1", "Japanese", "Korean", "game_dialogue")
+            self.assertIsNotNone(saved)
+            assert saved is not None
+            self.assertEqual(saved.created_by, "AI")
+
+    def test_manual_save_marks_manual(self) -> None:
+        _app()
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = PromptManager(presets_dir=Path(tmp))
+            page = PromptPage(manager=manager)
+            page.new_prompt()
+            page.set_editor_text("manual body")
+            page.doc_edit.setText("novel")
+            with patch.object(page, "_ask_text", return_value=("n2", True)):
+                page.save_current()
+            saved = manager.find_by_name("n2", "Japanese", "Korean", "novel")
+            self.assertIsNotNone(saved)
+            assert saved is not None
+            self.assertEqual(saved.created_by, "Manual")
+
+
+@unittest.skipUnless(PYSIDE_AVAILABLE, "PySide6이 필요합니다.")
+class SidebarInputTest(_WindowTestBase):
+    def test_no_settings_button(self) -> None:
+        from PySide6.QtWidgets import QPushButton
+        from script.gui.widgets.sidebar import Sidebar
+
+        _app()
+        sidebar = Sidebar()
+        self.assertFalse(hasattr(sidebar, "btn_settings"))
+        texts = [button.text() for button in sidebar.findChildren(QPushButton)]
+        self.assertTrue(all("환경설정" not in text for text in texts))
+
+    def test_three_pages_navigate(self) -> None:
+        window = self.make_window()
+        window.sidebar.btn_chat.click()
+        self.assertEqual(window.stack.currentIndex(), 0)
+        window.sidebar.btn_translation.click()
+        self.assertEqual(window.stack.currentIndex(), 1)
+        window.sidebar.btn_prompt.click()
+        self.assertEqual(window.stack.currentIndex(), 2)
+
+    def test_open_input_button_signal(self) -> None:
+        _app()
+        page = TranslationPage()
+        fired: list = []
+        page.open_input_requested.connect(lambda: fired.append(True))
+        page.btn_open_input.click()
+        self.assertEqual(fired, [True])
+
+    def test_open_input_creates_dir_and_url(self) -> None:
+        from PySide6.QtGui import QDesktopServices
+
+        window = self.make_window()
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "new-input"
+            window.translation_settings = TranslationSettings(
+                model="m", input_dir=target, output_dir=Path(tmp) / "out"
+            )
+            opened: list = []
+            with patch.object(
+                QDesktopServices, "openUrl", return_value=True
+            ) as opener:
+                window._on_open_input()
+                opened.extend(
+                    call.args[0].toString() for call in opener.call_args_list
+                )
+            self.assertTrue(target.is_dir())
+            self.assertTrue(any("new-input" in url for url in opened))
 
 
 if __name__ == "__main__":

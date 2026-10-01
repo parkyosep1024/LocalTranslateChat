@@ -102,6 +102,7 @@ class TranslationPage(QWidget):
     view_prompt_requested = Signal()
     new_prompt_requested = Signal()
     refresh_input_requested = Signal()
+    open_input_requested = Signal()
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -160,6 +161,10 @@ class TranslationPage(QWidget):
         refresh_row = QHBoxLayout()
         refresh_row.setContentsMargins(0, 0, 0, 0)
         refresh_row.addStretch(1)
+        self.btn_open_input = QPushButton("📂 input 폴더 열기")
+        self.btn_open_input.setObjectName("SecondaryButton")
+        self.btn_open_input.clicked.connect(self.open_input_requested.emit)
+        refresh_row.addWidget(self.btn_open_input)
         self.btn_refresh_input = QPushButton("↻ input 폴더 새로고침")
         self.btn_refresh_input.setObjectName("SecondaryButton")
         self.btn_refresh_input.clicked.connect(self.refresh_input_requested.emit)

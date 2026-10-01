@@ -12,14 +12,17 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMainWindow,
+    QMessageBox,
     QPushButton,
     QStackedWidget,
     QTextEdit,
     QVBoxLayout,
     QWidget,
+    QFileDialog,
 )
 
 from script.chat.chat_engine import ChatEngine
+from script.chat.session_store import ChatSessionStore
 from script.config.settings import Settings
 from script.config.translation_settings import INPUT_DIR, TranslationSettings
 from script.gui.pages.chat_page import ChatPage
@@ -34,6 +37,7 @@ from script.gui.workers import (
     TranslationWorker,
 )
 from script.providers.gemini import GeminiClient
+from script.providers.gemini_translation import GeminiTranslationProvider
 from script.providers.local_llm import LocalLLM
 from script.translation.file_loader import FileLoader
 from script.translation.file_writer import FileWriter
@@ -202,6 +206,9 @@ class MainWindow(QMainWindow):
         self.prompt_manager = PromptManager()
         self.translation_settings: TranslationSettings | None = self._load_translation_settings()
         self._prompt_presets: list[PromptPreset] = []
+        self.session_store = ChatSessionStore()
+        self._current_session_id: str | None = None
+        self._gemini_available = self._check_gemini_available()
 
         # thread/worker 추적 변수를 먼저 생성합니다.
         # (_check_ollama_status → _launch에서 사용하므로 순서가 바뀌면 crash합니다.)
@@ -256,17 +263,22 @@ class MainWindow(QMainWindow):
         self.chat_page.set_model_info(model_name)
         self.chat_page.send_requested.connect(self._on_chat_send)
         self.chat_page.new_chat_requested.connect(self._on_new_chat)
-        self.chat_page.clear_requested.connect(self._on_chat_cleared)
+        self.chat_page.clear_requested.connect(self._on_chat_clear_requested)
+        self.chat_page.export_requested.connect(self._on_chat_export)
+        self.chat_page.conversation_selected.connect(self._on_conversation_selected)
+        self._refresh_history()
 
         # 번역 연결
         self.translation_page.start_requested.connect(self._on_translation_start)
         self.translation_page.stop_requested.connect(self._on_translation_stop)
         self.translation_page.open_output_requested.connect(self._on_open_output)
+        self.translation_page.open_input_requested.connect(self._on_open_input)
         self.translation_page.files_changed.connect(self._on_files_changed)
         self.translation_page.field_changed.connect(self._on_field_toggled)
         self.translation_page.view_prompt_requested.connect(self._on_view_prompt)
         self.translation_page.new_prompt_requested.connect(self._on_new_prompt)
         self.translation_page.refresh_input_requested.connect(self._load_input_files)
+        self.prompt_page.ai_generate_requested.connect(self._on_prompt_page_generate)
         self._refresh_translation_prompts()
         # 기존 setting/input 폴더의 파일을 자동 로드합니다.
         self._load_input_files()
@@ -346,20 +358,128 @@ class MainWindow(QMainWindow):
             return "-"
         return getattr(self.chat_engine.client.settings, "model", "-") or "-"
 
+    def _check_gemini_available(self) -> bool:
+        try:
+            settings = Settings.from_env()
+            settings.validate()
+            return True
+        except Exception:
+            return False
+
     def _on_new_chat(self) -> None:
+        # 현재 대화는 성공 시마다 이미 저장되므로 새로 시작만 하면 됩니다.
+        self._current_session_id = None
         if self.chat_engine is not None:
             try:
                 self.chat_engine.clear_history()
             except Exception:
                 pass
         self.chat_page.clear_messages()
+        self.chat_page.set_conversation_title("새 대화")
+        self._refresh_history()
 
-    def _on_chat_cleared(self) -> None:
+    def _on_chat_clear_requested(self) -> None:
+        """저장된 대화를 보고 있으면 삭제 확인 후 영구 삭제합니다."""
+        session = (
+            self.session_store.get_session(self._current_session_id)
+            if self._current_session_id is not None
+            else None
+        )
+        if session is None:
+            self._reset_chat_view()
+            return
+        answer = QMessageBox.question(
+            self, "대화 삭제", "현재 대화를 삭제하시겠습니까?"
+        )
+        if answer != QMessageBox.Yes:
+            return
+        try:
+            self.session_store.delete_session(session["id"])
+        except Exception:
+            pass
+        self._reset_chat_view()
+
+    def _reset_chat_view(self) -> None:
+        self._current_session_id = None
         if self.chat_engine is not None:
             try:
                 self.chat_engine.clear_history()
             except Exception:
                 pass
+        self.chat_page.clear_messages()
+        self.chat_page.set_conversation_title("새 대화")
+        self._refresh_history()
+
+    def _refresh_history(self) -> None:
+        try:
+            sessions = self.session_store.list_sessions()
+        except Exception:
+            sessions = []
+        self.chat_page.set_conversations(sessions, self._current_session_id)
+
+    def _on_conversation_selected(self, session_id: str) -> None:
+        session = self.session_store.get_session(session_id)
+        if session is None:
+            return
+        messages = [
+            m for m in session.get("messages", [])
+            if isinstance(m, dict)
+            and m.get("role") in {"user", "assistant"}
+            and isinstance(m.get("content"), str)
+        ]
+        self._current_session_id = session["id"]
+        if self.chat_engine is not None:
+            try:
+                self.chat_engine.history.replace_messages(messages)
+            except ValueError:
+                try:
+                    self.chat_engine.clear_history()
+                except Exception:
+                    pass
+                self._current_session_id = None
+                return
+        self.chat_page.clear_messages()
+        for message in messages:
+            if message["role"] == "user":
+                self.chat_page.add_user_message(message["content"])
+            else:
+                self.chat_page.add_ai_message(message["content"])
+        self.chat_page.set_conversation_title(session.get("title", "새 대화") or "새 대화")
+        self._refresh_history()
+
+    def _on_chat_export(self) -> None:
+        # backend history를 단일 source로 사용하므로 오류 bubble은 제외됩니다.
+        messages = (
+            self.chat_engine.history.get_messages() if self.chat_engine else []
+        )
+        if not messages:
+            self.chat_page.add_error_message("내보낼 대화가 없습니다. 먼저 대화를 시작해주세요.")
+            return
+        title = self.chat_page.title_label.text().strip() or "새 대화"
+        from datetime import date, datetime
+
+        default_name = f"chat_{date.today().isoformat()}_{datetime.now().strftime('%H%M')}.txt"
+        path_str, _ = QFileDialog.getSaveFileName(
+            self, "대화 내보내기", default_name, "Text (*.txt)"
+        )
+        if not path_str:
+            return
+        lines = [
+            "Local Translate Chat",
+            "",
+            f"제목: {title}",
+            f"내보낸 날짜: {date.today().isoformat()}",
+            "",
+        ]
+        for message in messages:
+            if message.get("role") == "user":
+                lines += ["[사용자]", str(message.get("content", "")), ""]
+            elif message.get("role") == "assistant":
+                lines += ["[AI]", str(message.get("content", "")), ""]
+        try:
+            Path(path_str).write_text("\n".join(lines), encoding="utf-8")
+        except OSError as error:
+            self.chat_page.add_error_message(f"대화 저장에 실패했습니다: {error}")
 
     def _on_chat_send(self, text: str) -> None:
         if self.chat_engine is None:
@@ -387,6 +507,23 @@ class MainWindow(QMainWindow):
     def _on_chat_answer(self, answer: str) -> None:
         self.chat_page.add_ai_message(answer)
         self.chat_page.set_sending(False)
+        # ChatEngine은 성공 시에만 history를 남기므로 저장해도 안전합니다.
+        if self.chat_engine is not None:
+            try:
+                saved_id = self.session_store.save_session(
+                    self.chat_engine.history.get_messages(),
+                    session_id=self._current_session_id,
+                )
+            except Exception:
+                saved_id = None
+            if saved_id is not None:
+                self._current_session_id = saved_id
+                session = self.session_store.get_session(saved_id)
+                if session is not None:
+                    self.chat_page.set_conversation_title(
+                        session.get("title", "새 대화") or "새 대화"
+                    )
+                self._refresh_history()
 
     def _on_chat_failed(self, error: str) -> None:
         self.chat_page.add_error_message(f"요청 실패: {error}")
@@ -438,6 +575,9 @@ class MainWindow(QMainWindow):
         elif connected:
             self.sidebar.set_model_status(True, "● Ollama 연결됨")
             self.translation_page.set_engine_status(False, "○ 모델 없음")
+        elif self._gemini_available:
+            self.sidebar.set_model_status(False, "○ 로컬 모델 미연결 · API 번역 가능")
+            self.translation_page.set_engine_status(False, "○ 엔진 확인 필요")
         else:
             self.sidebar.set_model_status(False, "○ 로컬 모델 연결 안 됨")
             self.translation_page.set_engine_status(False)
@@ -684,6 +824,47 @@ class MainWindow(QMainWindow):
                     merged.append(name)
         return merged
 
+    def _local_engine_ready(self) -> bool:
+        """시작 시 1회만 엔진을 결정합니다. 중간 자동 전환은 하지 않습니다."""
+        return bool(self._ollama_connected and self._ollama_model_found)
+
+    def _start_with_api_fallback(self, reason: str) -> None:
+        """로컬 모델 불가 시 경고 후 명시적 승인만 API 번역을 진행합니다."""
+        self.translation_page.set_status(reason)
+        if not self._gemini_available:
+            self.translation_page.set_status(
+                f"{reason}\nGemini API 설정이 없어 API 번역을 사용할 수 없습니다."
+            )
+            return
+        if not self._confirm_api_fallback():
+            return
+        self._start_translation_job(use_api=True)
+
+    def _confirm_api_fallback(self) -> bool:
+        """외부 API 전송 경고를 띄우고 명시적 동의를 받습니다."""
+        box = QMessageBox(self)
+        box.setWindowTitle("API 번역 확인")
+        box.setText(
+            "로컬 번역 모델에 연결할 수 없습니다.\n\n"
+            "계속 진행하면 API에 연결된 AI를 사용하여 "
+            "선택한 파일의 번역 내용을 처리합니다.\n\n"
+            "번역할 원문이 외부 API로 전송될 수 있습니다.\n\n"
+            "계속하시겠습니까?"
+        )
+        cancel_button = box.addButton("취소", QMessageBox.RejectRole)
+        api_button = box.addButton("API로 번역", QMessageBox.AcceptRole)
+        box.setDefaultButton(cancel_button)
+        box.exec()
+        return box.clickedButton() is api_button
+
+    def _create_translation_llm(self, settings: TranslationSettings, use_api: bool):
+        """선택된 엔진 1개로 Translator를 만듭니다."""
+        if use_api:
+            gemini_settings = Settings.from_env()
+            gemini_settings.validate()
+            return GeminiTranslationProvider(GeminiClient(gemini_settings))
+        return LocalLLM(settings)
+
     # ---------- 번역 실행 ----------
     def _on_translation_start(self) -> None:
         if self.translation_settings is None:
@@ -699,15 +880,20 @@ class MainWindow(QMainWindow):
             )
             return
         if self._ollama_connected is False:
-            self.translation_page.set_status(
+            return self._start_with_api_fallback(
                 "Ollama 서버에 연결할 수 없습니다. Ollama가 실행 중인지 확인해주세요."
             )
-            return
         if self._ollama_connected and not self._ollama_model_found:
-            self.translation_page.set_status(
+            return self._start_with_api_fallback(
                 "설정된 Ollama 모델을 찾을 수 없습니다:\n"
                 f"{self.translation_settings.model}"
             )
+        self._start_translation_job(use_api=False)
+
+    def _start_translation_job(self, use_api: bool) -> None:
+        file_paths = self.translation_page.selected_paths()
+        if not file_paths:
+            self.translation_page.set_status("번역할 파일을 먼저 추가해주세요.")
             return
         # 파일별 선택값으로 검증합니다. 비어 있는 파일이 있으면 시작을 막습니다.
         # 전체 fallback이나 잘못된 field 자동 번역을 하지 않습니다.
@@ -745,12 +931,17 @@ class MainWindow(QMainWindow):
         target = _display_to_language(self.translation_page.target_combo.currentText())
         prompt_text, prompt_name = self._selected_translation_prompt()
         settings = self.translation_settings
+        try:
+            llm = self._create_translation_llm(settings, use_api)
+        except Exception as error:
+            self.translation_page.set_status(f"번역 엔진을 준비할 수 없습니다: {error}")
+            return
 
         def factory(stop_requested=None, on_progress=None, file_paths=None):
             handlers = self._build_handlers(file_paths or [], settings.chunk_max_chars)
             return Translator(
                 loader=FileLoader(settings.input_dir),
-                local_llm=LocalLLM(settings),
+                local_llm=llm,
                 writer=FileWriter(settings.output_dir),
                 chunk_max_chars=settings.chunk_max_chars,
                 source_language=source,
@@ -945,6 +1136,90 @@ class MainWindow(QMainWindow):
             f"AI Prompt 생성 실패: {error} "
             "Prompt 설정 화면에서 직접 만들 수 있습니다."
         )
+
+    # ---------- Prompt 설정 화면 AI 생성 (기존 PromptDraftWorker 재사용) ----------
+    def _on_prompt_page_generate(self) -> None:
+        if self._prompt_thread is not None and self._prompt_thread.isRunning():
+            return
+        source = self.prompt_page.source_combo.currentText().strip()
+        target = self.prompt_page.target_combo.currentText().strip()
+        document_type = self.prompt_page.doc_edit.text().strip()
+        if not document_type:
+            self.prompt_page.set_validation(False, "문서 유형을 입력해주세요.")
+            return
+        if self._schema_pending:
+            self.prompt_page.set_validation(
+                False, "AI 분석이 끝난 후 Prompt를 생성해주세요."
+            )
+            return
+        file_paths = self.translation_page.selected_paths()
+        if file_paths:
+            self._sync_displayed_selection()
+            sample = collect_detection_sample(file_paths, self._all_selected_fields())
+        else:
+            sample_path, _ = QFileDialog.getOpenFileName(
+                self, "Prompt 생성용 sample 파일", "", "Text/CSV/JSON (*.txt *.csv *.json)"
+            )
+            if not sample_path:
+                return
+            sample = collect_detection_sample([Path(sample_path)], None)
+        if not sample.strip():
+            self.prompt_page.set_validation(False, "Prompt 생성용 샘플이 없습니다.")
+            return
+        try:
+            gemini_settings = Settings.from_env()
+            gemini_settings.validate()
+        except Exception:
+            self.prompt_page.set_validation(
+                False, "Gemini API 설정이 없습니다. .env를 확인해주세요."
+            )
+            return
+        builder = PromptBuilder(GeminiPromptAI(GeminiClient(gemini_settings)))
+        worker = PromptDraftWorker(
+            builder, file_paths, source, target, document_type, sample
+        )
+        thread = QThread(self)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(self._on_prompt_page_draft)
+        worker.failed.connect(self._on_prompt_page_draft_failed)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        self._launch(
+            thread, worker,
+            {"_prompt_thread": thread, "_prompt_worker": worker},
+        )
+        self.prompt_page.set_generating(True)
+        self._prompt_thread = thread
+        self._prompt_worker = worker
+        thread.start()
+
+    def _on_prompt_page_draft(self, draft: str) -> None:
+        self.prompt_page.set_generating(False)
+        self._prompt_worker = None
+        self.prompt_page.apply_ai_draft(
+            draft,
+            self.prompt_page.source_combo.currentText().strip(),
+            self.prompt_page.target_combo.currentText().strip(),
+            self.prompt_page.doc_edit.text().strip(),
+        )
+
+    def _on_prompt_page_draft_failed(self, error: str) -> None:
+        self.prompt_page.set_generating(False)
+        self._prompt_worker = None
+        self.prompt_page.set_validation(False, f"AI Prompt 생성 실패: {error}")
+
+    def _on_open_input(self) -> None:
+        input_dir = (
+            self.translation_settings.input_dir
+            if self.translation_settings is not None
+            else INPUT_DIR
+        )
+        try:
+            input_dir.mkdir(parents=True, exist_ok=True)
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(input_dir.resolve())))
+        except Exception:
+            pass
 
     def _on_translation_finished(self, summary: object) -> None:
         self.translation_page.set_translation_state("done")
