@@ -366,7 +366,15 @@ class MainWindow(QMainWindow):
         except Exception:
             return False
 
+    def _chat_busy(self) -> bool:
+        """Gemini 응답 대기 중이면 True. signal 직접 호출에도 state가 꼬이지 않게 합니다."""
+        return (
+            self._chat_thread is not None and self._chat_thread.isRunning()
+        )
+
     def _on_new_chat(self) -> None:
+        if self._chat_busy():
+            return
         # 현재 대화는 성공 시마다 이미 저장되므로 새로 시작만 하면 됩니다.
         self._current_session_id = None
         if self.chat_engine is not None:
@@ -380,6 +388,8 @@ class MainWindow(QMainWindow):
 
     def _on_chat_clear_requested(self) -> None:
         """저장된 대화를 보고 있으면 삭제 확인 후 영구 삭제합니다."""
+        if self._chat_busy():
+            return
         session = (
             self.session_store.get_session(self._current_session_id)
             if self._current_session_id is not None
@@ -418,6 +428,8 @@ class MainWindow(QMainWindow):
         self.chat_page.set_conversations(sessions, self._current_session_id)
 
     def _on_conversation_selected(self, session_id: str) -> None:
+        if self._chat_busy():
+            return
         session = self.session_store.get_session(session_id)
         if session is None:
             return
@@ -448,6 +460,8 @@ class MainWindow(QMainWindow):
         self._refresh_history()
 
     def _on_chat_export(self) -> None:
+        if self._chat_busy():
+            return
         # backend history를 단일 source로 사용하므로 오류 bubble은 제외됩니다.
         messages = (
             self.chat_engine.history.get_messages() if self.chat_engine else []
@@ -487,7 +501,7 @@ class MainWindow(QMainWindow):
                 "Gemini API 설정이 없습니다. .env의 GEMINI_API_KEY / GEMINI_MODEL을 확인해주세요."
             )
             return
-        if self._chat_thread is not None and self._chat_thread.isRunning():
+        if self._chat_busy():
             self.chat_page.add_error_message("이전 요청을 처리 중입니다. 잠시 후 다시 시도해주세요.")
             return
         self.chat_page.set_sending(True)
@@ -531,10 +545,14 @@ class MainWindow(QMainWindow):
 
     # ---------- Ollama 상태 ----------
     def _load_translation_settings(self) -> TranslationSettings | None:
+        """GUI runtime 설정을 읽습니다.
+
+        OLLAMA_MODEL이 비어 있다는 이유만으로 None으로 만들지 않습니다.
+        그래야 모델 없이 Gemini만 설정된 PC에서도 API fallback까지 도달합니다.
+        LocalLLM 실제 사용 시점에는 기존 validate()가 그대로 적용됩니다.
+        """
         try:
-            settings = TranslationSettings.from_env()
-            settings.validate()
-            return settings
+            return TranslationSettings.from_env()
         except Exception:
             return None
 
@@ -833,7 +851,8 @@ class MainWindow(QMainWindow):
         self.translation_page.set_status(reason)
         if not self._gemini_available:
             self.translation_page.set_status(
-                f"{reason}\nGemini API 설정이 없어 API 번역을 사용할 수 없습니다."
+                "사용 가능한 번역 엔진이 없습니다.\n"
+                "Ollama 모델을 연결하거나 Gemini API 설정을 확인해주세요."
             )
             return
         if not self._confirm_api_fallback():
@@ -920,6 +939,9 @@ class MainWindow(QMainWindow):
             return
         self.translation_page.set_translation_state("running")
         self.translation_page.set_progress(0, "번역 준비 중…")
+        self.translation_page.set_status(
+            f"번역 엔진: {'Gemini API' if use_api else 'Local Ollama'}"
+        )
 
         source, notice = detect_source_language(
             self.translation_page.source_combo.currentText(),
@@ -1141,12 +1163,24 @@ class MainWindow(QMainWindow):
     def _on_prompt_page_generate(self) -> None:
         if self._prompt_thread is not None and self._prompt_thread.isRunning():
             return
+        # 초기 빈 화면에서도 바로 쓸 수 있게 새 Prompt mode로 진입합니다.
+        # 이때 기존 editor 내용은 보존합니다.
+        if self.prompt_page.current is None and not self.prompt_page.is_new:
+            existing = self.prompt_page.editor_text()
+            self.prompt_page.new_prompt()
+            if existing.strip():
+                self.prompt_page.set_editor_text(existing)
         source = self.prompt_page.source_combo.currentText().strip()
         target = self.prompt_page.target_combo.currentText().strip()
         document_type = self.prompt_page.doc_edit.text().strip()
         if not document_type:
-            self.prompt_page.set_validation(False, "문서 유형을 입력해주세요.")
-            return
+            document_type, ok = QInputDialog.getText(
+                self, "문서 유형", "문서 유형을 입력하세요:", text="game_dialogue"
+            )
+            if not ok or not document_type.strip():
+                return
+            document_type = document_type.strip()
+            self.prompt_page.doc_edit.setText(document_type)
         if self._schema_pending:
             self.prompt_page.set_validation(
                 False, "AI 분석이 끝난 후 Prompt를 생성해주세요."

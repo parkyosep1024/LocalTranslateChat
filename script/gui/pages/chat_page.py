@@ -74,6 +74,7 @@ class ChatPage(QWidget):
         new_btn.setObjectName("PrimaryButton")
         new_btn.clicked.connect(self.new_chat_requested.emit)
         layout.addWidget(new_btn)
+        self.new_chat_button = new_btn
 
         search_row = QHBoxLayout()
         label = QLabel("최근 대화")
@@ -140,6 +141,8 @@ class ChatPage(QWidget):
         clear_btn.clicked.connect(self.clear_requested.emit)
         header.addWidget(export_btn)
         header.addWidget(clear_btn)
+        self.export_button = export_btn
+        self.clear_button = clear_btn
         container.addLayout(header)
 
         self.scroll = QScrollArea()
@@ -281,8 +284,13 @@ class ChatPage(QWidget):
             self.subtitle_label.setText("○ 모델 미연결")
 
     def set_sending(self, busy: bool) -> None:
+        """요청 중에는 전송 외에 대화 전환/삭제/export도 막아 race를 방지합니다."""
         self.send_button.setEnabled(not busy)
         self.input.setReadOnly(busy)
+        self.new_chat_button.setEnabled(not busy)
+        self.history_list.setEnabled(not busy)
+        self.clear_button.setEnabled(not busy)
+        self.export_button.setEnabled(not busy)
 
     def _refresh_empty_state(self) -> None:
         has_message = self.message_count() > 0
@@ -314,6 +322,8 @@ class ChatPage(QWidget):
         self.title_label.setText(title)
 
     def _emit_send(self) -> None:
+        if self.input.isReadOnly():
+            return
         text = self.input.toPlainText().strip()
         if not text:
             return

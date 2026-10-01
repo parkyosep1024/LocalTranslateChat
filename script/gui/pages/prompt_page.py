@@ -204,13 +204,10 @@ class PromptPage(QWidget):
         self.ai_button = QPushButton("✦ AI로 Prompt 생성")
         self.ai_button.setObjectName("SecondaryButton")
         self.ai_button.clicked.connect(self.ai_generate_requested.emit)
-        self.edit_button = QPushButton("✎ 수정")
-        self.edit_button.setObjectName("PrimaryButton")
         self.delete_button = QPushButton("🗑 삭제")
         self.delete_button.setObjectName("DangerButton")
         self.delete_button.clicked.connect(self.delete_current)
         top.addWidget(self.ai_button)
-        top.addWidget(self.edit_button)
         top.addWidget(self.delete_button)
         card.inner.addLayout(top)
 

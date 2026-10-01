@@ -4,7 +4,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -1596,6 +1596,113 @@ class ChatSessionGuiTest(_WindowTestBase):
 
 
 @unittest.skipUnless(PYSIDE_AVAILABLE, "PySide6이 필요합니다.")
+class ChatRaceTest(_WindowTestBase):
+    def _busy_window(self, window) -> None:
+        thread = MagicMock()
+        thread.isRunning.return_value = True
+        window._chat_thread = thread
+
+    def test_sending_disables_controls(self) -> None:
+        _app()
+        page = ChatPage()
+        page.set_sending(True)
+        self.assertFalse(page.send_button.isEnabled())
+        self.assertTrue(page.input.isReadOnly())
+        self.assertFalse(page.new_chat_button.isEnabled())
+        self.assertFalse(page.history_list.isEnabled())
+        self.assertFalse(page.clear_button.isEnabled())
+        self.assertFalse(page.export_button.isEnabled())
+        page.set_sending(False)
+        self.assertTrue(page.send_button.isEnabled())
+        self.assertFalse(page.input.isReadOnly())
+        self.assertTrue(page.new_chat_button.isEnabled())
+        self.assertTrue(page.history_list.isEnabled())
+        self.assertTrue(page.clear_button.isEnabled())
+        self.assertTrue(page.export_button.isEnabled())
+
+    def test_busy_new_chat_blocked(self) -> None:
+        window = self.make_window()
+        with tempfile.TemporaryDirectory() as tmp:
+            self.use_tmp_store(window, tmp)
+            window.chat_engine = _FakeChatEngine(("a",))
+            window.chat_page.input.setPlainText("q")
+            window.chat_page._emit_send()
+            self.assertTrue(
+                self.wait_for(lambda: window.chat_page.message_count() == 2)
+            )
+            session_id = window._current_session_id
+            self._busy_window(window)
+            window._on_new_chat()
+            self.assertEqual(window._current_session_id, session_id)
+            self.assertEqual(window.chat_page.message_count(), 2)
+            self.assertEqual(len(window.chat_engine.history.get_messages()), 2)
+
+    def test_busy_select_blocked(self) -> None:
+        window = self.make_window()
+        with tempfile.TemporaryDirectory() as tmp:
+            self.use_tmp_store(window, tmp)
+            window.chat_engine = _FakeChatEngine(("a",))
+            window.chat_page.input.setPlainText("q")
+            window.chat_page._emit_send()
+            self.assertTrue(
+                self.wait_for(lambda: window.chat_page.message_count() == 2)
+            )
+            window._on_new_chat()
+            self._busy_window(window)
+            first_id = window.session_store.list_sessions()[0]["id"]
+            window._on_conversation_selected(first_id)
+            self.assertIsNone(window._current_session_id)
+            self.assertEqual(window.chat_page.message_count(), 0)
+
+    def test_busy_delete_blocked(self) -> None:
+        window = self.make_window()
+        with tempfile.TemporaryDirectory() as tmp:
+            self.use_tmp_store(window, tmp)
+            window.chat_engine = _FakeChatEngine(("a",))
+            window.chat_page.input.setPlainText("q")
+            window.chat_page._emit_send()
+            self.assertTrue(
+                self.wait_for(lambda: window.chat_page.message_count() == 2)
+            )
+            self._busy_window(window)
+            with patch("script.gui.main_window.QMessageBox") as box:
+                box.question.return_value = box.Yes
+                window._on_chat_clear_requested()
+                box.question.assert_not_called()
+            self.assertEqual(len(window.session_store.list_sessions()), 1)
+
+    def test_idle_allows_after_success(self) -> None:
+        window = self.make_window()
+        with tempfile.TemporaryDirectory() as tmp:
+            self.use_tmp_store(window, tmp)
+            window.chat_engine = _FakeChatEngine(("a",))
+            window.chat_page.input.setPlainText("q")
+            window.chat_page._emit_send()
+            self.assertTrue(
+                self.wait_for(lambda: window.chat_page.message_count() == 2)
+            )
+            window._chat_thread = None
+            window._on_new_chat()
+            self.assertIsNone(window._current_session_id)
+            self.assertEqual(window.chat_page.message_count(), 0)
+
+    def test_busy_export_blocked(self) -> None:
+        window = self.make_window()
+        with tempfile.TemporaryDirectory() as tmp:
+            self.use_tmp_store(window, tmp)
+            window.chat_engine = _FakeChatEngine(("a",))
+            window.chat_page.input.setPlainText("q")
+            window.chat_page._emit_send()
+            self.assertTrue(
+                self.wait_for(lambda: window.chat_page.message_count() == 2)
+            )
+            self._busy_window(window)
+            with patch("script.gui.main_window.QFileDialog") as dialog:
+                dialog.getSaveFileName.side_effect = AssertionError("호출 금지")
+                window._on_chat_export()
+
+
+@unittest.skipUnless(PYSIDE_AVAILABLE, "PySide6이 필요합니다.")
 class TranslationFallbackTest(_WindowTestBase):
     def test_local_engine_selected_when_ready(self) -> None:
         from script.providers.local_llm import LocalLLM
@@ -1647,7 +1754,67 @@ class TranslationFallbackTest(_WindowTestBase):
             target.write_text("hello", encoding="utf-8")
             window.translation_page.add_file_path(target)
             window._on_translation_start()
-            self.assertIn("설정이 없어", window.translation_page.status_label.text())
+            self.assertIn("사용 가능한 번역 엔진이 없습니다", window.translation_page.status_label.text())
+            self.assertIsNone(window._translation_worker)
+
+    def test_empty_ollama_model_reaches_fallback(self) -> None:
+        # A. OLLAMA_MODEL이 비어도 settings가 None이 되지 않고 fallback 확인에 도달합니다.
+        window = self.make_window()
+        window.translation_settings = TranslationSettings(model="")
+        window._ollama_connected = False
+        window._gemini_available = True
+        self.assertIsNotNone(window.translation_settings)
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "a.txt"
+            target.write_text("hello", encoding="utf-8")
+            window.translation_page.add_file_path(target)
+            with patch.object(
+                MainWindow, "_confirm_api_fallback", return_value=False
+            ):
+                window._on_translation_start()
+            self.assertIsNone(window._translation_worker)
+            self.assertNotEqual(window.translation_page._state, "running")
+
+    def test_empty_model_approved_starts_gemini_job(self) -> None:
+        # B. 승인 시 Gemini provider로 TranslationWorker가 시작됩니다.
+        window = self.make_window()
+        with tempfile.TemporaryDirectory() as tmp:
+            window.translation_settings = TranslationSettings(
+                model="", input_dir=Path(tmp), output_dir=Path(tmp) / "out"
+            )
+            window._ollama_connected = False
+            window._gemini_available = True
+            target = Path(tmp) / "a.txt"
+            target.write_text("hello {player_name}", encoding="utf-8")
+            window.translation_page.add_file_path(target)
+            with patch.object(MainWindow, "_confirm_api_fallback", return_value=True), \
+                patch.object(window, "_create_translation_llm", return_value=self._echo_llm()):
+                window._on_translation_start()
+            self.assertTrue(
+                self.wait_for(
+                    lambda: window.translation_page._state in {"done", "stopped"},
+                    timeout_ms=30000,
+                )
+            )
+            out = Path(tmp) / "out" / "a.txt"
+            self.assertTrue(out.is_file())
+            self.assertIn("{player_name}", out.read_text(encoding="utf-8"))
+
+    def test_empty_model_no_gemini_blocks(self) -> None:
+        # D. OLLAMA_MODEL 없음 + Gemini 설정 없음 → 시작 금지 + 안내.
+        window = self.make_window()
+        window.translation_settings = TranslationSettings(model="")
+        window._ollama_connected = False
+        window._gemini_available = False
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "a.txt"
+            target.write_text("hello", encoding="utf-8")
+            window.translation_page.add_file_path(target)
+            window._on_translation_start()
+            self.assertIn(
+                "사용 가능한 번역 엔진이 없습니다",
+                window.translation_page.status_label.text(),
+            )
             self.assertIsNone(window._translation_worker)
 
     def _echo_llm(self):
@@ -1755,12 +1922,50 @@ class PromptPageGenerateTest(_WindowTestBase):
             page.ai_button.click()
             self.assertEqual(fired, [True])
 
-    def test_empty_doctype_blocks_call(self) -> None:
+    def test_empty_doctype_dialog_cancel_blocks_call(self) -> None:
         window = self.make_window()
         window.prompt_page.doc_edit.clear()
-        window._on_prompt_page_generate()
+        with patch("script.gui.main_window.QInputDialog") as dialog:
+            dialog.getText.return_value = ("", False)
+            window._on_prompt_page_generate()
         self.assertIsNone(window._prompt_worker)
-        self.assertIn("문서 유형", window.prompt_page.validation_label.text())
+
+    def test_empty_doctype_dialog_accept_continues(self) -> None:
+        window = self.make_window()
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "a.txt"
+            target.write_text("hello world, hello again", encoding="utf-8")
+            window.translation_page.add_file_path(target)
+            window.prompt_page.doc_edit.clear()
+
+            class FakeBuilder:
+                def create_draft(self, files, source, target, doc, sample_text=None):
+                    assert doc == "my_docs"
+                    return "DRAFT-DOC"
+
+            with patch("script.gui.main_window.QInputDialog") as dialog, \
+                patch("script.gui.main_window.Settings") as settings_cls, \
+                patch("script.gui.main_window.PromptBuilder", return_value=FakeBuilder()):
+                dialog.getText.return_value = ("my_docs", True)
+                settings_cls.from_env.return_value.validate.return_value = None
+                window._on_prompt_page_generate()
+                self.assertTrue(
+                    self.wait_for(lambda: "DRAFT-DOC" in window.prompt_page.editor_text())
+                )
+            self.assertEqual(window.prompt_page.doc_edit.text(), "my_docs")
+
+    def test_initial_empty_state_enters_new_prompt_mode(self) -> None:
+        window = self.make_window()
+        self.assertEqual(window.prompt_page.title_label.text(), "Prompt를 선택하세요")
+        window.prompt_page.doc_edit.clear()
+        with patch("script.gui.main_window.QInputDialog") as dialog:
+            dialog.getText.return_value = ("", False)
+            window._on_prompt_page_generate()
+        # 새 Prompt mode 진입: form/editor 입력 가능, 취소 시 Gemini 호출 없음.
+        self.assertTrue(window.prompt_page.is_new)
+        self.assertFalse(window.prompt_page.editor.isReadOnly())
+        self.assertTrue(window.prompt_page.doc_edit.isEnabled())
+        self.assertIsNone(window._prompt_worker)
 
     def test_success_inserts_draft_without_save(self) -> None:
         window = self.make_window()
@@ -1870,6 +2075,39 @@ class PromptPageGenerateTest(_WindowTestBase):
                     self.wait_for(lambda: "SLOW" in window.prompt_page.editor_text())
                 )
             self.assertTrue(window.prompt_page.ai_button.isEnabled())
+
+    def test_existing_preset_not_overwritten(self) -> None:
+        window = self.make_window()
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "a.txt"
+            target.write_text("hello world, hello again", encoding="utf-8")
+            window.translation_page.add_file_path(target)
+            manager = PromptManager(presets_dir=Path(tmp) / "presets")
+            preset = manager.create_preset(
+                "keep", "Japanese", "Korean", "game_dialogue", "original body"
+            )
+            saved_path = manager.save(preset)
+            before = saved_path.read_text(encoding="utf-8")
+            window.prompt_page.manager = manager
+            window.prompt_page.load_presets()
+            window.prompt_page.select_preset(window.prompt_page.presets[0])
+
+            class FakeBuilder:
+                def create_draft(self, files, source, target, doc, sample_text=None):
+                    return "NEW-DRAFT"
+
+            with patch("script.gui.main_window.QInputDialog") as dialog, \
+                patch("script.gui.main_window.Settings") as settings_cls, \
+                patch("script.gui.main_window.PromptBuilder", return_value=FakeBuilder()):
+                dialog.getText.return_value = ("game_dialogue", True)
+                settings_cls.from_env.return_value.validate.return_value = None
+                window._on_prompt_page_generate()
+                self.assertTrue(
+                    self.wait_for(lambda: "NEW-DRAFT" in window.prompt_page.editor_text())
+                )
+            self.assertEqual(saved_path.read_text(encoding="utf-8"), before)
+            self.assertIsNone(window.prompt_page.current)
+            self.assertTrue(window.prompt_page.ai_draft)
 
     def test_ai_draft_save_marks_ai(self) -> None:
         _app()
